@@ -9,8 +9,10 @@ https://docs.djangoproject.com/en/5.2/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
-
+import os
 from pathlib import Path
+import dj_database_url
+
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -77,23 +79,24 @@ WSGI_APPLICATION = "truepost.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
-# DATABASES = {
-#     "default": {
-#         "ENGINE": "django.db.backends.sqlite3",
-#         "NAME": BASE_DIR / "db.sqlite3",
-#     }
-# }
+
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'truepost',
-        'USER': 'postgres',
-        'PASSWORD': 'Inno-997',
-        'HOST': 'localhost',
-        'PORT': '5432',
-    }
+    'default': dj_database_url.parse(
+        os.environ.get('DATABASE_URL')
+    )
 }
+
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': 'truepost',
+#         'USER': 'postgres',
+#         'PASSWORD': 'Inno-997',
+#         'HOST': 'localhost',
+#         'PORT': '5432',
+#     }
+# }
 
 
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
@@ -121,6 +124,8 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/
 
+#postgresql://truepost_user:7IgH7Fr3J4WVzA7fq6JE5pGxhY0D0W7c@dpg-d51e5qre5dus739t0av0-a/truepost
+
 LANGUAGE_CODE = "en-us"
 
 TIME_ZONE = "UTC"
@@ -133,11 +138,21 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
-STATIC_URL = "static/"
+# 1. Static Configuration
+STATIC_URL = '/static/'
 
-# Default primary key field type
-# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
+# Directories where Django will look for YOUR custom static files
+STATICFILES_DIRS = [
+    BASE_DIR / 'static',
+]
 
+# 🌟 2. CRITICAL FIX: The destination folder for collectstatic 🌟
+# This is where all files (including Summernote's) will be gathered.
+STATIC_ROOT = BASE_DIR / 'staticfiles' 
+
+# 3. Media Configuration (Needed for Summernote uploads)
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # REST Framework configuration
@@ -173,6 +188,6 @@ NORMAL_USER_JWT_ACCESS_MINUTES = 15
 NORMAL_USER_JWT_REFRESH_DAYS = 7
 NORMAL_USER_OTP_MINUTES = 10
 NORMAL_USER_VERIFY_TOKEN_HOURS = 24
-NORMAL_USER_EMAIL_VERIFY_URL = "http://192.168.1.189:8000/api/auth/verify-email/"
+NORMAL_USER_EMAIL_VERIFY_URL = "https://trustpost-platform.onrender.com/api/auth/verify-email/"
 NORMAL_USER_PASSWORD_RESET_URL = "/api/auth/password-reset/confirm/"
 # lxtc pnvq lboz czed app password from gmail 
