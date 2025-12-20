@@ -19,8 +19,29 @@ class AuthenticatedNormalUser:
         return True
 
     @property
+    def is_anonymous(self):
+        return False
+
+    @property
     def normal_user(self) -> NormalUser:
         return self._normal_user
+
+    # Provide common attributes used by code expecting a Django User-like object
+    @property
+    def id(self):
+        return self._normal_user.id
+
+    @property
+    def pk(self):
+        return self._normal_user.pk
+
+    def __getattr__(self, name):
+        """
+        Delegate unknown attributes to the underlying NormalUser instance.
+        This improves compatibility for code that accesses request.user.username,
+        email, etc. without breaking the explicit normal_user property.
+        """
+        return getattr(self._normal_user, name)
 
     def __str__(self):
         return f"AuthenticatedNormalUser({self._normal_user})"

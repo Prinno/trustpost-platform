@@ -3,8 +3,11 @@ from django.utils import timezone
 
 
 class NormalUser(models.Model):
+    username = models.CharField(max_length=50, unique=True, null=True, blank=True)
     email = models.EmailField(unique=True, null=True, blank=True)
     phone = models.CharField(max_length=20, unique=True, null=True, blank=True)
+    public_username = models.CharField(max_length=50, unique=True, null=True, blank=True)
+    avatar_url = models.URLField(null=True, blank=True)
     password = models.CharField(max_length=255)
     is_active = models.BooleanField(default=False)
     is_email_verified = models.BooleanField(default=False)
@@ -36,6 +39,24 @@ class VerificationToken(models.Model):
         return (not self.used) and (self.expires_at > timezone.now())
 
 
+class PendingRegistration(models.Model):
+    """
+    Stores registration payload until email verification succeeds.
+    No NormalUser row is created at registration time.
+    """
+    username = models.CharField(max_length=50)
+    email = models.EmailField(null=True, blank=True)
+    phone = models.CharField(max_length=20, null=True, blank=True)
+    password = models.CharField(max_length=255)  # already hashed
+    token = models.CharField(max_length=128, unique=True)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def is_valid(self) -> bool:
+        return (not self.used) and (self.expires_at > timezone.now())
+
+
 class PhoneOTP(models.Model):
     user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="phone_otps")
     code = models.CharField(max_length=6)
@@ -57,3 +78,144 @@ class RefreshToken(models.Model):
 
     def is_active(self) -> bool:
         return (not self.revoked) and (self.expires_at > timezone.now())
+
+
+class PasswordResetOTP(models.Model):
+    """
+    Email-only password reset OTP.
+    - Numeric code (6 digits)
+    - Expires after configured minutes
+    - Single-use
+    """
+    email = models.EmailField()
+    code = models.CharField(max_length=6)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def is_valid(self) -> bool:
+        return (not self.used) and (self.expires_at > timezone.now())
+
+
+class PasswordResetSession(models.Model):
+    """
+    Temporary authorization created after successful OTP verification.
+    Must be presented to perform password reset.
+    """
+    email = models.EmailField()
+    token = models.CharField(max_length=128, unique=True)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def is_valid(self) -> bool:
+        return (not self.used) and (self.expires_at > timezone.now())
+
+
+class Post(models.Model):
+    TEXT_ONLY = "text_only"
+    SINGLE_WITH_TEXT = "single_with_text"
+    MULTI_SHARED = "multi_shared"
+    MULTI_PER_TEXT = "multi_per_text"
+    MODE_CHOICES = (
+        (TEXT_ONLY, "Text only"),
+        (SINGLE_WITH_TEXT, "Single media with text"),
+        (MULTI_SHARED, "Multiple media with shared text"),
+        (MULTI_PER_TEXT, "Multiple media each with text"),
+    )
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    STATUS_CHOICES = (
+        (PENDING, "Pending"),
+        (APPROVED, "Approved"),
+        (REJECTED, "Rejected"),
+    )
+
+    author = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="posts")
+    mode = models.CharField(max_length=32, choices=MODE_CHOICES)
+    main_text = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=PENDING)
+    rejection_reason = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Post#{self.pk} by {self.author_id} ({self.mode}/{self.status})"
+
+
+class PostItem(models.Model):
+    IMAGE = "image"
+    VIDEO = "video"
+    MEDIA_CHOICES = (
+        (IMAGE, "Image"),
+        (VIDEO, "Video"),
+    )
+
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="items")
+    media_type = models.CharField(max_length=8, choices=MEDIA_CHOICES)
+    file_url = models.URLField()
+    caption_text = models.TextField(blank=True)
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["order", "id"]
+
+    def __str__(self):
+        return f"PostItem#{self.pk} ({self.media_type}) for Post#{self.post_id}"
+
+
+class ModerationAction(models.Model):
+    """Audit log for content moderation actions."""
+    ACTION_APPROVE = "approve"
+    ACTION_REJECT = "reject"
+    ACTION_EDIT = "edit"
+    ACTION_REMOVE = "remove"
+    ACTION_WARN = "warn"
+    ACTION_RESTRICT = "restrict"
+    ACTION_CHOICES = (
+        (ACTION_APPROVE, "Approve"),
+        (ACTION_REJECT, "Reject"),
+        (ACTION_EDIT, "Edit"),
+        (ACTION_REMOVE, "Remove"),
+        (ACTION_WARN, "Warn"),
+        (ACTION_RESTRICT, "Restrict"),
+    )
+
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="moderation_actions", null=True, blank=True)
+    actor_username = models.CharField(max_length=150)  # snapshot of admin username
+    actor_role = models.CharField(max_length=16)  # admin/superadmin
+    action = models.CharField(max_length=16, choices=ACTION_CHOICES)
+    reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"ModerationAction({self.action}) by {self.actor_username} on Post#{getattr(self.post, 'id', None)}"
+
+
+class UserRestriction(models.Model):
+    """Restrictions applied to NormalUser accounts (e.g., posting suspension)."""
+    TYPE_POST_SUSPEND = "post_suspend"
+    TYPE_ACCOUNT_SUSPEND = "account_suspend"
+    TYPE_CHOICES = (
+        (TYPE_POST_SUSPEND, "Posting Suspension"),
+        (TYPE_ACCOUNT_SUSPEND, "Account Suspension"),
+    )
+
+    user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="restrictions")
+    type = models.CharField(max_length=32, choices=TYPE_CHOICES)
+    reason = models.TextField(blank=True)
+    until = models.DateTimeField(null=True, blank=True)  # null => permanent
+    created_by = models.CharField(max_length=150)  # admin username snapshot
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def is_active(self):
+        from django.utils import timezone
+        if self.until is None:
+            return True
+        return self.until > timezone.now()
+
+    def __str__(self):
+        return f"Restriction({self.type}) for User#{self.user_id} active={self.is_active()}"
