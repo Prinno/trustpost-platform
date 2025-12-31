@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 from django.conf import settings
+from django.db import models
 from django.contrib.auth import authenticate, get_user_model
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -11,7 +12,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .authentication import create_jwt
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, ModerationAction, UserRestriction
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, PostVersion, Feedback
 from admin_auth.permissions import IsAdminEnabled, IsSuperAdmin
 from admin_auth.models import AdminAccount
 from .permissions import IsNormalUser
@@ -29,6 +30,7 @@ from .serializers import (
     VerifyPhoneOTPSerializer,
     PostSerializer,
     UserRestrictionSerializer,
+    FeedbackSerializer,
 )
 from .utils import generate_token, generate_otp, now_utc, email_send
 
@@ -532,6 +534,78 @@ class MePostListCreateView(generics.ListCreateAPIView):
         serializer.save()
 
 
+class MePostEditView(generics.GenericAPIView):
+    """Allow a normal user to edit own post content.
+    - If post is APPROVED, create a pending version and mark post as PENDING_REAPPROVAL.
+    - Keep last approved version for public display.
+    - Users cannot edit system metadata (author, moderation fields, status).
+    """
+    permission_classes = [IsNormalUser]
+    serializer_class = PostSerializer
+
+    def patch(self, request, pk, *args, **kwargs):
+        post = get_object_or_404(Post, pk=pk, author=request.user.normal_user)
+
+        # Only allow content fields
+        mode = request.data.get("mode", post.mode)
+        main_text = (request.data.get("main_text") or post.main_text or "").strip()
+        items = request.data.get("items")
+
+        # Update content snapshot to post records
+        post.mode = mode
+        post.main_text = main_text
+
+        # Replace items if provided
+        if isinstance(items, list):
+            PostItem.objects.filter(post=post).delete()
+            for order, it in enumerate(items):
+                PostItem.objects.create(
+                    post=post,
+                    media_type=it.get("media_type") or PostItem.IMAGE,
+                    file_url=it.get("file_url"),
+                    caption_text=(it.get("caption_text") or ""),
+                    order=it.get("order", order),
+                )
+
+        # Versioning: create pending version
+        next_ver = (post.versions.aggregate(models.Max("version")).get("version__max") or 0) + 1
+        from django.core.serializers.json import DjangoJSONEncoder
+        import json
+        snap_items = []
+        for it in PostItem.objects.filter(post=post).order_by("order", "id"):
+            snap_items.append({
+                "media_type": it.media_type,
+                "file_url": it.file_url,
+                "caption_text": it.caption_text,
+                "order": it.order,
+            })
+        PostVersion.objects.create(
+            post=post,
+            version=next_ver,
+            editor_user=request.user.normal_user,
+            status=PostVersion.STATUS_PENDING,
+            mode=post.mode,
+            main_text=post.main_text,
+            items_json=json.dumps(snap_items, cls=DjangoJSONEncoder),
+        )
+
+        # Transition status based on previous state
+        # - If previously approved: require re-approval but keep last approved snapshot public
+        # - If previously rejected: move back to pending and clear rejection reason
+        if post.status == Post.APPROVED:
+            post.status = Post.PENDING_REAPPROVAL
+            post.save(update_fields=["mode", "main_text", "status", "updated_at"])
+        elif post.status == Post.REJECTED:
+            post.status = Post.PENDING
+            post.rejection_reason = None
+            post.save(update_fields=["mode", "main_text", "status", "rejection_reason", "updated_at"])
+        else:
+            # Pending or other: remain pending-like
+            post.status = Post.PENDING if post.status != Post.PENDING_REAPPROVAL else post.status
+            post.save(update_fields=["mode", "main_text", "status", "updated_at"])
+        return Response(PostSerializer(post).data)
+
+
 class MeRestrictionsView(generics.ListAPIView):
     permission_classes = [IsNormalUser]
     serializer_class = UserRestrictionSerializer
@@ -575,7 +649,18 @@ class AdminPendingPostsListView(generics.ListAPIView):
     serializer_class = PostSerializer
 
     def get_queryset(self):
-        return Post.objects.filter(status=Post.PENDING).order_by("-created_at")
+        # Include both fresh pending and pending re-approval edits
+        return Post.objects.filter(
+            models.Q(status=Post.PENDING) | models.Q(status=getattr(Post, 'PENDING_REAPPROVAL', Post.PENDING))
+        ).order_by("-created_at")
+
+
+class AdminRejectedPostsListView(generics.ListAPIView):
+    permission_classes = [IsAdminEnabled]
+    serializer_class = PostSerializer
+
+    def get_queryset(self):
+        return Post.objects.filter(status=Post.REJECTED).order_by("-created_at")
 
 
 class AdminApprovePostView(generics.GenericAPIView):
@@ -587,6 +672,9 @@ class AdminApprovePostView(generics.GenericAPIView):
         if acc and not acc.permissions.get("can_approve", True):
             return Response({"detail": "Not permitted to approve"}, status=403)
         post = get_object_or_404(Post, pk=pk)
+        # Safety: only allow approve for pending states
+        if post.status not in {Post.PENDING, getattr(Post, 'PENDING_REAPPROVAL', Post.PENDING)}:
+            return Response({"detail": "Cannot approve in current status"}, status=400)
         post.status = Post.APPROVED
         post.rejection_reason = None
         post.save(update_fields=["status", "rejection_reason", "updated_at"])
@@ -600,7 +688,63 @@ class AdminApprovePostView(generics.GenericAPIView):
             action=ModerationAction.ACTION_APPROVE,
             reason="",
         )
+        # Snapshot approved version
+        next_ver = (post.versions.aggregate(models.Max("version")).get("version__max") or 0) + 1
+        import json
+        from django.core.serializers.json import DjangoJSONEncoder
+        snap_items = []
+        for it in PostItem.objects.filter(post=post).order_by("order", "id"):
+            snap_items.append({
+                "media_type": it.media_type,
+                "file_url": it.file_url,
+                "caption_text": it.caption_text,
+                "order": it.order,
+            })
+        PostVersion.objects.create(
+            post=post,
+            version=next_ver,
+            editor_admin_username=getattr(actor, "username", str(actor)),
+            editor_role=role,
+            status=PostVersion.STATUS_APPROVED,
+            mode=post.mode,
+            main_text=post.main_text,
+            items_json=json.dumps(snap_items, cls=DjangoJSONEncoder),
+        )
+        post.last_approved_version = next_ver
+        post.save(update_fields=["last_approved_version", "updated_at"])
         return Response(PostSerializer(post).data)
+
+
+class AdminUpdateRejectionReasonView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def patch(self, request, pk, *args, **kwargs):
+        post = get_object_or_404(Post, pk=pk)
+        if post.status != Post.REJECTED:
+            return Response({"detail": "Post is not rejected"}, status=400)
+        reason = (request.data.get("reason") or "").strip()
+        post.rejection_reason = reason
+        post.save(update_fields=["rejection_reason", "updated_at"])
+        # Audit log
+        actor = request.user
+        role = AdminAccount.ROLE_SUPERADMIN if getattr(actor, "is_superuser", False) else AdminAccount.ROLE_ADMIN
+        ModerationAction.objects.create(
+            post=post,
+            actor_username=getattr(actor, "username", str(actor)),
+            actor_role=role,
+            action=ModerationAction.ACTION_EDIT,
+            reason=f"Update rejection reason: {reason}",
+        )
+        return Response(PostSerializer(post).data)
+
+
+class AdminDeletePostView(generics.DestroyAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def delete(self, request, pk, *args, **kwargs):
+        post = get_object_or_404(Post, pk=pk)
+        post.delete()
+        return Response(status=204)
 
 
 class AdminRejectPostView(generics.GenericAPIView):
@@ -641,6 +785,140 @@ class AdminRejectPostView(generics.GenericAPIView):
             except Exception:
                 pass
 
+        return Response(PostSerializer(post).data)
+
+
+class AdminEditPostView(generics.GenericAPIView):
+    """Admin/SuperAdmin can edit any post and set status.
+    If set to APPROVED, snapshot as approved version and update last_approved_version.
+    """
+    permission_classes = [IsAdminEnabled]
+    serializer_class = PostSerializer
+
+    def patch(self, request, pk, *args, **kwargs):
+        post = get_object_or_404(Post, pk=pk)
+        mode = request.data.get("mode", post.mode)
+        main_text = (request.data.get("main_text") or post.main_text or "").strip()
+        items = request.data.get("items")
+        new_status = (request.data.get("status") or post.status)
+
+        post.mode = mode
+        post.main_text = main_text
+        if isinstance(items, list):
+            PostItem.objects.filter(post=post).delete()
+            for order, it in enumerate(items):
+                PostItem.objects.create(
+                    post=post,
+                    media_type=it.get("media_type") or PostItem.IMAGE,
+                    file_url=it.get("file_url"),
+                    caption_text=(it.get("caption_text") or ""),
+                    order=it.get("order", order),
+                )
+
+        actor = request.user
+        role = AdminAccount.ROLE_SUPERADMIN if getattr(actor, "is_superuser", False) else AdminAccount.ROLE_ADMIN
+
+        import json
+        from django.core.serializers.json import DjangoJSONEncoder
+        snap_items = []
+        for it in PostItem.objects.filter(post=post).order_by("order", "id"):
+            snap_items.append({
+                "media_type": it.media_type,
+                "file_url": it.file_url,
+                "caption_text": it.caption_text,
+                "order": it.order,
+            })
+
+        # If explicitly approving
+        if new_status == Post.APPROVED:
+            post.status = Post.APPROVED
+            post.rejection_reason = None
+            post.save(update_fields=["status", "rejection_reason", "mode", "main_text", "updated_at"])
+
+            next_ver = (post.versions.aggregate(models.Max("version")).get("version__max") or 0) + 1
+            PostVersion.objects.create(
+                post=post,
+                version=next_ver,
+                editor_admin_username=getattr(actor, "username", str(actor)),
+                editor_role=role,
+                status=PostVersion.STATUS_APPROVED,
+                mode=post.mode,
+                main_text=post.main_text,
+                items_json=json.dumps(snap_items, cls=DjangoJSONEncoder),
+            )
+            post.last_approved_version = next_ver
+            post.save(update_fields=["last_approved_version", "updated_at"])
+            ModerationAction.objects.create(
+                post=post,
+                actor_username=getattr(actor, "username", str(actor)),
+                actor_role=role,
+                action=ModerationAction.ACTION_EDIT,
+                reason="Approved edit",
+            )
+        elif new_status == Post.REJECTED:
+            post.status = Post.REJECTED
+            post.save(update_fields=["status", "mode", "main_text", "updated_at"])
+            ModerationAction.objects.create(
+                post=post,
+                actor_username=getattr(actor, "username", str(actor)),
+                actor_role=role,
+                action=ModerationAction.ACTION_EDIT,
+                reason="Rejected edit",
+            )
+        else:
+            # Pending edit: if previously approved, mark pending re-approval
+            post.status = Post.PENDING_REAPPROVAL if post.last_approved_version else Post.PENDING
+            post.save(update_fields=["status", "mode", "main_text", "updated_at"])
+            next_ver = (post.versions.aggregate(models.Max("version")).get("version__max") or 0) + 1
+            PostVersion.objects.create(
+                post=post,
+                version=next_ver,
+                editor_admin_username=getattr(actor, "username", str(actor)),
+                editor_role=role,
+                status=PostVersion.STATUS_PENDING,
+                mode=post.mode,
+                main_text=post.main_text,
+                items_json=json.dumps(snap_items, cls=DjangoJSONEncoder),
+            )
+        return Response(PostSerializer(post).data)
+
+
+class AdminRollbackPostView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def post(self, request, pk, version, *args, **kwargs):
+        post = get_object_or_404(Post, pk=pk)
+        pv = get_object_or_404(PostVersion, post=post, version=version, status=PostVersion.STATUS_APPROVED)
+        # Apply snapshot
+        post.mode = pv.mode
+        post.main_text = pv.main_text
+        PostItem.objects.filter(post=post).delete()
+        import json
+        items = []
+        try:
+            items = json.loads(pv.items_json or "[]")
+        except Exception:
+            items = []
+        for order, it in enumerate(items):
+            PostItem.objects.create(
+                post=post,
+                media_type=it.get("media_type") or PostItem.IMAGE,
+                file_url=it.get("file_url"),
+                caption_text=(it.get("caption_text") or ""),
+                order=it.get("order", order),
+            )
+        post.status = Post.APPROVED
+        post.last_approved_version = pv.version
+        post.save(update_fields=["mode", "main_text", "status", "last_approved_version", "updated_at"])
+        actor = request.user
+        role = AdminAccount.ROLE_SUPERADMIN if getattr(actor, "is_superuser", False) else AdminAccount.ROLE_ADMIN
+        ModerationAction.objects.create(
+            post=post,
+            actor_username=getattr(actor, "username", str(actor)),
+            actor_role=role,
+            action=ModerationAction.ACTION_EDIT,
+            reason=f"Rollback to version {pv.version}",
+        )
         return Response(PostSerializer(post).data)
 
 
@@ -718,4 +996,155 @@ class PublicApprovedPostsView(generics.ListAPIView):
     serializer_class = PostSerializer
 
     def get_queryset(self):
-        return Post.objects.filter(status=Post.APPROVED).order_by("-created_at")
+        # Include posts in pending re-approval but still show their last approved snapshot
+        return Post.objects.filter(models.Q(status=Post.APPROVED) | models.Q(status=Post.PENDING_REAPPROVAL)).order_by("-created_at")
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["is_public"] = True
+        return ctx
+
+
+class SubmitFeedbackView(generics.CreateAPIView):
+    permission_classes = [IsNormalUser]
+    serializer_class = FeedbackSerializer
+
+    def create(self, request, *args, **kwargs):
+        # Expect: post_id, content
+        post_id = request.data.get("post_id")
+        content = (request.data.get("content") or "").strip()
+        if not post_id:
+            return Response({"detail": "post_id is required"}, status=400)
+        post = get_object_or_404(Post, pk=post_id)
+        serializer = self.get_serializer(data={"content": content})
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save(post=post)
+        headers = self.get_success_headers(serializer.data)
+        return Response(FeedbackSerializer(instance).data, status=201, headers=headers)
+
+
+class AdminPendingFeedbackListView(generics.ListAPIView):
+    permission_classes = [IsAdminEnabled]
+    serializer_class = FeedbackSerializer
+
+    def get_queryset(self):
+        return Feedback.objects.filter(status=Feedback.STATUS_PENDING).order_by("-created_at", "-id")
+
+class AdminApprovedFeedbackListView(generics.ListAPIView):
+    permission_classes = [IsAdminEnabled]
+    serializer_class = FeedbackSerializer
+
+    def get_queryset(self):
+        return Feedback.objects.filter(status=Feedback.STATUS_APPROVED).order_by("-created_at", "-id")
+
+class AdminRejectedFeedbackListView(generics.ListAPIView):
+    permission_classes = [IsAdminEnabled]
+    serializer_class = FeedbackSerializer
+
+    def get_queryset(self):
+        return Feedback.objects.filter(status=Feedback.STATUS_REJECTED).order_by("-created_at", "-id")
+
+
+class AdminApproveFeedbackView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def post(self, request, pk, *args, **kwargs):
+        fb = get_object_or_404(Feedback, pk=pk)
+        if fb.status != Feedback.STATUS_PENDING:
+            return Response({"detail": "Feedback not pending"}, status=400)
+        fb.status = Feedback.STATUS_APPROVED
+        fb.save(update_fields=["status"])
+        # Optional: notify post author via email
+        author = getattr(getattr(fb.post, "author", None), "email", None)
+        if author:
+            try:
+                email_send("New feedback approved", f"Someone left feedback on your post: {fb.content}", author)
+            except Exception:
+                pass
+        return Response(FeedbackSerializer(fb).data)
+
+
+class AdminRejectFeedbackView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def post(self, request, pk, *args, **kwargs):
+        fb = get_object_or_404(Feedback, pk=pk)
+        if fb.status != Feedback.STATUS_PENDING:
+            return Response({"detail": "Feedback not pending"}, status=400)
+        fb.status = Feedback.STATUS_REJECTED
+        fb.save(update_fields=["status"])
+        # Optional: notify feedback author via email with provided reason
+        try:
+            reason = (request.data.get("reason") or "").strip()
+        except Exception:
+            reason = ""
+        author_email = getattr(getattr(fb, "author", None), "email", None)
+        if author_email:
+            try:
+                subject = "Your feedback was rejected"
+                body = (
+                    f"Your feedback on Post #{fb.post_id} has been rejected by an admin."
+                    + (f" Reason: {reason}" if reason else "")
+                )
+                email_send(subject, body, author_email)
+            except Exception:
+                pass
+        return Response(FeedbackSerializer(fb).data)
+
+
+class PublicApprovedFeedbackByPostView(generics.ListAPIView):
+    """Public: list approved feedback for a given post.
+    Visible when a user views a public post.
+    """
+    permission_classes = [AllowAny]
+    serializer_class = FeedbackSerializer
+
+    def get_queryset(self):
+        pk = self.kwargs.get("pk")
+        post = get_object_or_404(Post, pk=pk)
+        # Only allow for public/approved posts (or pending re-approval snapshot)
+        if post.status not in (Post.APPROVED, getattr(Post, "PENDING_REAPPROVAL", Post.APPROVED)):
+            return Feedback.objects.none()
+        return Feedback.objects.filter(post_id=post.id, status=Feedback.STATUS_APPROVED).order_by("-created_at", "-id")
+
+
+class MyRejectedFeedbackListView(generics.ListAPIView):
+    """Normal user: list my rejected feedback entries."""
+    permission_classes = [IsNormalUser]
+    serializer_class = FeedbackSerializer
+
+    def get_queryset(self):
+        user = getattr(self.request.user, "normal_user", None)
+        if not user:
+            return Feedback.objects.none()
+        return Feedback.objects.filter(author=user, status=Feedback.STATUS_REJECTED).order_by("-created_at", "-id")
+
+
+class EditRejectedFeedbackView(generics.GenericAPIView):
+    """Normal user: edit a rejected feedback to resubmit for review.
+    Allows changing content and resets status to PENDING.
+    """
+    permission_classes = [IsNormalUser]
+
+    def patch(self, request, pk, *args, **kwargs):
+        return self._update(request, pk)
+
+    def put(self, request, pk, *args, **kwargs):
+        return self._update(request, pk)
+
+    def _update(self, request, pk):
+        fb = get_object_or_404(Feedback, pk=pk)
+        user = getattr(request.user, "normal_user", None)
+        if not user or fb.author_id != getattr(user, "id", None):
+            return Response({"detail": "Not allowed"}, status=403)
+        if fb.status != Feedback.STATUS_REJECTED:
+            return Response({"detail": "Only rejected feedback can be edited"}, status=400)
+        content = (request.data.get("content") or "").strip()
+        if not content:
+            return Response({"detail": "Content is required"}, status=400)
+        if len(content) > 3000:
+            return Response({"detail": "Content exceeds 3000 characters"}, status=400)
+        fb.content = content
+        fb.status = Feedback.STATUS_PENDING
+        fb.save(update_fields=["content", "status"])
+        return Response(FeedbackSerializer(fb).data)

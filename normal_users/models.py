@@ -125,10 +125,12 @@ class Post(models.Model):
     )
 
     PENDING = "pending"
+    PENDING_REAPPROVAL = "pending_reapproval"
     APPROVED = "approved"
     REJECTED = "rejected"
     STATUS_CHOICES = (
         (PENDING, "Pending"),
+        (PENDING_REAPPROVAL, "Pending Re-Approval"),
         (APPROVED, "Approved"),
         (REJECTED, "Rejected"),
     )
@@ -136,8 +138,9 @@ class Post(models.Model):
     author = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="posts")
     mode = models.CharField(max_length=32, choices=MODE_CHOICES)
     main_text = models.TextField(blank=True)
-    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=PENDING)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=PENDING)
     rejection_reason = models.TextField(null=True, blank=True)
+    last_approved_version = models.PositiveIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -167,6 +170,36 @@ class PostItem(models.Model):
         return f"PostItem#{self.pk} ({self.media_type}) for Post#{self.post_id}"
 
 
+class PostVersion(models.Model):
+    """Immutable snapshot of a Post's content for versioning/rollback."""
+    STATUS_PENDING = "pending"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+    STATUS_CHOICES = (
+        (STATUS_PENDING, "Pending"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_REJECTED, "Rejected"),
+    )
+
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="versions")
+    version = models.PositiveIntegerField()
+    editor_user = models.ForeignKey(NormalUser, on_delete=models.SET_NULL, null=True, blank=True)
+    editor_admin_username = models.CharField(max_length=150, null=True, blank=True)
+    editor_role = models.CharField(max_length=16, null=True, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    mode = models.CharField(max_length=32)
+    main_text = models.TextField(blank=True)
+    items_json = models.TextField(blank=True, help_text="JSON array of item snapshots: media_type, file_url, caption_text, order")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("post", "version")
+        ordering = ["-created_at", "-version"]
+
+    def __str__(self):
+        return f"PostVersion#{self.version} for Post#{self.post_id} ({self.status})"
+
+
 class ModerationAction(models.Model):
     """Audit log for content moderation actions."""
     ACTION_APPROVE = "approve"
@@ -193,6 +226,33 @@ class ModerationAction(models.Model):
 
     def __str__(self):
         return f"ModerationAction({self.action}) by {self.actor_username} on Post#{getattr(self.post, 'id', None)}"
+
+
+class Feedback(models.Model):
+    STATUS_PENDING = "pending"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+    STATUS_CHOICES = (
+        (STATUS_PENDING, "Pending"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_REJECTED, "Rejected"),
+    )
+
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="feedbacks")
+    author = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="feedbacks")
+    content = models.TextField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["status", "created_at"]),
+            models.Index(fields=["post", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Feedback#{self.pk} on Post#{self.post_id} by {self.author_id} ({self.status})"
 
 
 class UserRestriction(models.Model):

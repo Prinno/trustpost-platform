@@ -2,7 +2,9 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, Feedback
+from .models import PostVersion
+import json
 
 
 class NormalUserSerializer(serializers.ModelSerializer):
@@ -204,12 +206,16 @@ class PostItemSerializer(serializers.ModelSerializer):
 
 class PostSerializer(serializers.ModelSerializer):
     items = PostItemSerializer(many=True, required=False)
+    author_public_username = serializers.SerializerMethodField(read_only=True)
+    author_avatar_url = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Post
         fields = [
             "id",
             "author",
+            "author_public_username",
+            "author_avatar_url",
             "mode",
             "main_text",
             "status",
@@ -219,6 +225,46 @@ class PostSerializer(serializers.ModelSerializer):
             "items",
         ]
         read_only_fields = ["author", "status", "rejection_reason", "created_at", "updated_at"]
+
+    def get_author_public_username(self, obj):
+        pu = getattr(getattr(obj, "author", None), "public_username", None)
+        # Only expose public handle if present
+        return pu if pu else None
+
+    def get_author_avatar_url(self, obj):
+        return getattr(getattr(obj, "author", None), "avatar_url", None)
+
+    def to_representation(self, instance):
+        """
+        For public views: if post is pending re-approval, present the last approved snapshot
+        so public users see only approved content.
+        """
+        data = super().to_representation(instance)
+        is_public = self.context.get("is_public")
+        try:
+            if is_public and instance.status == Post.PENDING_REAPPROVAL and instance.last_approved_version:
+                pv = PostVersion.objects.filter(post=instance, version=instance.last_approved_version, status=PostVersion.STATUS_APPROVED).first()
+                if pv:
+                    data["main_text"] = pv.main_text or ""
+                    # Replace items with snapshot
+                    items = []
+                    try:
+                        snap = json.loads(pv.items_json or "[]")
+                        for it in snap:
+                            items.append({
+                                "id": None,
+                                "media_type": it.get("media_type"),
+                                "file_url": it.get("file_url"),
+                                "caption_text": it.get("caption_text") or "",
+                                "order": it.get("order") or 0,
+                            })
+                    except Exception:
+                        items = []
+                    data["items"] = items
+        except Exception:
+            # Fail-safe: leave default representation
+            pass
+        return data
 
     def validate(self, attrs):
         mode = attrs.get("mode")
@@ -323,3 +369,54 @@ class UserRestrictionSerializer(serializers.ModelSerializer):
             "created_by",
             "created_at",
         ]
+
+
+class FeedbackSerializer(serializers.ModelSerializer):
+    author_username = serializers.SerializerMethodField(read_only=True)
+    post_main_text = serializers.SerializerMethodField(read_only=True)
+    author_id = serializers.SerializerMethodField(read_only=True)
+    post_id = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = Feedback
+        fields = [
+            "id",
+            "post_id",
+            "author_id",
+            "author_username",
+            "post_main_text",
+            "content",
+            "status",
+            "created_at",
+        ]
+        read_only_fields = ["status", "created_at", "author_id", "post_id", "author_username", "post_main_text"]
+
+    def get_author_username(self, obj):
+        return getattr(getattr(obj, "author", None), "public_username", None) or getattr(getattr(obj, "author", None), "username", None)
+
+    def get_post_main_text(self, obj):
+        return getattr(getattr(obj, "post", None), "main_text", None)
+
+    def get_author_id(self, obj):
+        return getattr(getattr(obj, "author", None), "id", None)
+
+    def get_post_id(self, obj):
+        return getattr(getattr(obj, "post", None), "id", None)
+
+    def validate(self, attrs):
+        content = (attrs.get("content") or "").strip()
+        if not content:
+            raise serializers.ValidationError("Content is required")
+        if len(content) > 3000:
+            raise serializers.ValidationError("Content exceeds 3000 characters")
+        return attrs
+
+    def create(self, validated_data):
+        # Author must be the current normal user
+        request = self.context.get("request")
+        author = getattr(getattr(request, "user", None), "normal_user", None)
+        if not author:
+            raise serializers.ValidationError("Invalid author")
+        validated_data["author"] = author
+        validated_data["status"] = Feedback.STATUS_PENDING
+        return super().create(validated_data)

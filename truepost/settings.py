@@ -27,6 +27,7 @@ SECRET_KEY = "django-insecure-df0h8)-5cl0$^n37i#uor_823eai!mwf@dep(2zx%91hqdv!t2
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
+#ALLOWED_HOSTS = [ 'localhost', '192.168.1.189',"127.0.0.1"]
 ALLOWED_HOSTS = [ '*']
 
 
@@ -185,10 +186,11 @@ DEFAULT_FROM_EMAIL = 'TruePost Verifications <innocentphilbert39@gmail.com>'
 
 # Normal user auth settings
 NORMAL_USER_JWT_SECRET = SECRET_KEY
-NORMAL_USER_JWT_ACCESS_MINUTES = 15
+NORMAL_USER_JWT_ACCESS_MINUTES = 4320
 NORMAL_USER_JWT_REFRESH_DAYS = 7
 NORMAL_USER_OTP_MINUTES = 10
 NORMAL_USER_VERIFY_TOKEN_HOURS = 24
+# NORMAL_USER_EMAIL_VERIFY_URL = "http://192.168.1.189/api/auth/verify-email/"
 NORMAL_USER_EMAIL_VERIFY_URL = "https://trustpost-platform.onrender.com/api/auth/verify-email/"
 NORMAL_USER_PASSWORD_RESET_URL = "/api/auth/password-reset/confirm/"
 # lxtc pnvq lboz czed app password from gmail 
