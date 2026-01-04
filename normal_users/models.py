@@ -135,7 +135,11 @@ class Post(models.Model):
         (REJECTED, "Rejected"),
     )
 
-    author = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="posts")
+    # Normal user author (nullable to allow admin-authored posts)
+    author = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="posts", null=True, blank=True)
+    # Admin/SuperAdmin author
+    admin_author = models.ForeignKey("admin_auth.AdminAccount", on_delete=models.SET_NULL, null=True, blank=True, related_name="admin_posts")
+    created_by_role = models.CharField(max_length=16, null=True, blank=True, help_text="normal | admin | superadmin")
     mode = models.CharField(max_length=32, choices=MODE_CHOICES)
     main_text = models.TextField(blank=True)
     status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=PENDING)
@@ -145,7 +149,8 @@ class Post(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"Post#{self.pk} by {self.author_id} ({self.mode}/{self.status})"
+        who = self.author_id or self.admin_author_id
+        return f"Post#{self.pk} by {who} ({self.mode}/{self.status})"
 
 
 class PostItem(models.Model):
@@ -279,3 +284,66 @@ class UserRestriction(models.Model):
 
     def __str__(self):
         return f"Restriction({self.type}) for User#{self.user_id} active={self.is_active()}"
+
+
+class PostReaction(models.Model):
+    """Reactions on posts by normal users. Currently supports like.
+    Unique per user/post/reaction_type to prevent duplicates.
+    """
+    REACT_LIKE = "like"
+    REACTION_CHOICES = (
+        (REACT_LIKE, "Like"),
+    )
+
+    user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="reactions")
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="reactions")
+    reaction_type = models.CharField(max_length=16, choices=REACTION_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "post", "reaction_type")
+        indexes = [
+            models.Index(fields=["post", "reaction_type"]),
+            models.Index(fields=["user", "reaction_type"]),
+        ]
+
+    def __str__(self):
+        return f"Reaction({self.reaction_type}) u#{self.user_id} p#{self.post_id}"
+
+
+class RewardTransaction(models.Model):
+    """Per-action reward record to prevent duplicate awards and enable auditing."""
+    ACT_VIEW = "view"
+    ACT_LIKE = "like"
+    ACT_COMMENT = "comment"
+    ACTION_CHOICES = (
+        (ACT_VIEW, "View"),
+        (ACT_LIKE, "Like"),
+        (ACT_COMMENT, "Comment"),
+    )
+
+    user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="reward_transactions")
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="reward_transactions")
+    action_type = models.CharField(max_length=16, choices=ACTION_CHOICES)
+    tokens = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "post", "action_type")
+        indexes = [
+            models.Index(fields=["user"]),
+            models.Index(fields=["post", "action_type"]),
+        ]
+
+    def __str__(self):
+        return f"RewardTxn({self.action_type}:{self.tokens}) u#{self.user_id} p#{self.post_id}"
+
+
+class UserTokenBalance(models.Model):
+    """Cumulative token balance per user. Updated when RewardTransaction is created."""
+    user = models.OneToOneField(NormalUser, on_delete=models.CASCADE, related_name="token_balance")
+    balance = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"TokenBalance u#{self.user_id} = {self.balance}"

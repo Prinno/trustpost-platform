@@ -12,9 +12,10 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .authentication import create_jwt
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, PostVersion, Feedback
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, PostVersion, Feedback, PostReaction, RewardTransaction, UserTokenBalance
 from admin_auth.permissions import IsAdminEnabled, IsSuperAdmin
 from admin_auth.models import AdminAccount
+from admin_auth.permissions import IsSuperAdmin
 from .permissions import IsNormalUser
 from .serializers import (
     LoginSerializer,
@@ -31,6 +32,7 @@ from .serializers import (
     PostSerializer,
     UserRestrictionSerializer,
     FeedbackSerializer,
+    RewardTransactionSerializer,
 )
 from .utils import generate_token, generate_otp, now_utc, email_send
 
@@ -516,11 +518,10 @@ class MeAvatarUploadView(generics.GenericAPIView):
         path = default_storage.save(filename, avatar)
         # Build absolute URL
         rel_url = f"{settings.MEDIA_URL}{path}"
-        absolute_url = request.build_absolute_uri(rel_url)
-
-        user.avatar_url = absolute_url
+        # Store and return RELATIVE media path to remain IP-agnostic
+        user.avatar_url = rel_url
         user.save(update_fields=["avatar_url"])
-        return Response({"avatar_url": absolute_url})
+        return Response({"avatar_url": rel_url})
 
 
 class MePostListCreateView(generics.ListCreateAPIView):
@@ -635,13 +636,43 @@ class MeUploadMediaView(generics.GenericAPIView):
         filename = f"posts/{request.user.normal_user.id}_{int(now().timestamp())}{ext}"
         path = default_storage.save(filename, file)
         rel_url = f"{settings.MEDIA_URL}{path}"
-        absolute_url = request.build_absolute_uri(rel_url)
 
         media_type = "image"
         if ext in [".mp4", ".mov", ".mkv", ".webm"]:
             media_type = "video"
 
-        return Response({"url": absolute_url, "media_type": media_type})
+        # Return relative path; Flutter client will prepend BASE_URL
+        return Response({"url": rel_url, "media_type": media_type})
+
+
+class AdminUploadMediaView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, *args, **kwargs):
+        file = request.FILES.get("file")
+        if not file:
+            return Response({"detail": "No file provided"}, status=400)
+
+        import os
+        from django.conf import settings
+        from django.core.files.storage import default_storage
+        from django.utils.timezone import now
+
+        ext = os.path.splitext(file.name)[1].lower()
+        if not ext:
+            ext = ".bin"
+        # Use 'posts/' path similarly; admin author id not tied to NormalUser
+        filename = f"posts/admin_{getattr(request.user, 'id', 'x')}_{int(now().timestamp())}{ext}"
+        path = default_storage.save(filename, file)
+        rel_url = f"{settings.MEDIA_URL}{path}"
+
+        media_type = "image"
+        if ext in [".mp4", ".mov", ".mkv", ".webm"]:
+            media_type = "video"
+
+        # Return relative path; Flutter client will prepend BASE_URL
+        return Response({"url": rel_url, "media_type": media_type})
 
 
 class AdminPendingPostsListView(generics.ListAPIView):
@@ -653,6 +684,79 @@ class AdminPendingPostsListView(generics.ListAPIView):
         return Post.objects.filter(
             models.Q(status=Post.PENDING) | models.Q(status=getattr(Post, 'PENDING_REAPPROVAL', Post.PENDING))
         ).order_by("-created_at")
+        
+class AdminPostCreateView(generics.CreateAPIView):
+    """Admin/SuperAdmin create posts using same serializer/validation.
+    Content is created as PENDING by default; use publish API to approve.
+    """
+    permission_classes = [IsAdminEnabled]
+    serializer_class = PostSerializer
+
+    def perform_create(self, serializer):
+        serializer.save()
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            # Log serializer errors for easier debugging
+            try:
+                print("AdminPostCreateView validation errors:", serializer.errors)
+            except Exception:
+                pass
+            return Response(serializer.errors, status=400)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=201, headers=headers)
+
+
+class AdminPublishPostView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def post(self, request, pk, *args, **kwargs):
+        post = get_object_or_404(Post, pk=pk)
+        # Only admin-authored or normal-authored posts can be published; rules equal for roles
+        # Approve and snapshot
+        post.status = Post.APPROVED
+        post.rejection_reason = None
+        post.save(update_fields=["status", "rejection_reason", "updated_at"])
+
+        actor = request.user
+        role = AdminAccount.ROLE_SUPERADMIN if getattr(actor, "is_superuser", False) else AdminAccount.ROLE_ADMIN
+        ModerationAction.objects.create(
+            post=post,
+            actor_username=getattr(actor, "username", str(actor)),
+            actor_role=role,
+            action=ModerationAction.ACTION_APPROVE,
+            reason="Admin publish",
+        )
+
+        next_ver = (post.versions.aggregate(models.Max("version")).get("version__max") or 0) + 1
+        import json
+        from django.core.serializers.json import DjangoJSONEncoder
+        snap_items = []
+        for it in PostItem.objects.filter(post=post).order_by("order", "id"):
+            snap_items.append({
+                "media_type": it.media_type,
+                "file_url": it.file_url,
+                "caption_text": it.caption_text,
+                "order": it.order,
+            })
+        PostVersion.objects.create(
+            post=post,
+            version=next_ver,
+            editor_admin_username=getattr(actor, "username", str(actor)),
+            editor_role=role,
+            status=PostVersion.STATUS_APPROVED,
+            mode=post.mode,
+            main_text=post.main_text,
+            items_json=json.dumps(snap_items, cls=DjangoJSONEncoder),
+        )
+        post.last_approved_version = next_ver
+        post.save(update_fields=["last_approved_version", "updated_at"])
+        return Response(PostSerializer(post).data)
+
+
+# SuperAdmin immediate publish endpoint removed per request; use Admin create + moderation flow.
 
 
 class AdminRejectedPostsListView(generics.ListAPIView):
@@ -1019,8 +1123,45 @@ class SubmitFeedbackView(generics.CreateAPIView):
         serializer = self.get_serializer(data={"content": content})
         serializer.is_valid(raise_exception=True)
         instance = serializer.save(post=post)
+        # Do NOT award here; coins for comments are granted only after admin approval.
         headers = self.get_success_headers(serializer.data)
         return Response(FeedbackSerializer(instance).data, status=201, headers=headers)
+
+    def _award_reward(self, user, post, action):
+        from django.conf import settings
+        from django.utils import timezone
+        from django.db import transaction
+        from django.db.models import F
+        # Values: VIEW_TOKENS, LIKE_TOKENS, COMMENT_TOKENS
+        tokens_table = {
+            RewardTransaction.ACT_VIEW: getattr(settings, "REWARD_VIEW_TOKENS", 1),
+            RewardTransaction.ACT_LIKE: getattr(settings, "REWARD_LIKE_TOKENS", 2),
+            RewardTransaction.ACT_COMMENT: getattr(settings, "REWARD_COMMENT_TOKENS", 5),
+        }
+        # Daily limits per action
+        limits_table = {
+            RewardTransaction.ACT_VIEW: getattr(settings, "REWARD_VIEW_DAILY_LIMIT", 50),
+            RewardTransaction.ACT_LIKE: getattr(settings, "REWARD_LIKE_DAILY_LIMIT", 20),
+            RewardTransaction.ACT_COMMENT: getattr(settings, "REWARD_COMMENT_DAILY_LIMIT", 10),
+        }
+        tval = tokens_table.get(action, 0)
+        # Enforce per-user daily limit per action across posts
+        start_of_day = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        awarded_today = RewardTransaction.objects.filter(user=user, action_type=action, created_at__gte=start_of_day).count()
+        if awarded_today >= limits_table.get(action, 0):
+            return
+        # Prevent duplicates per user/post/action via unique_together
+        with transaction.atomic():
+            obj, created = RewardTransaction.objects.get_or_create(
+                user=user,
+                post=post,
+                action_type=action,
+                defaults={"tokens": tval},
+            )
+            if created and tval > 0:
+                bal, _ = UserTokenBalance.objects.select_for_update().get_or_create(user=user, defaults={"balance": 0})
+                bal.balance = F("balance") + tval
+                bal.save(update_fields=["balance", "updated_at"])
 
 
 class AdminPendingFeedbackListView(generics.ListAPIView):
@@ -1054,6 +1195,41 @@ class AdminApproveFeedbackView(generics.GenericAPIView):
             return Response({"detail": "Feedback not pending"}, status=400)
         fb.status = Feedback.STATUS_APPROVED
         fb.save(update_fields=["status"])
+        # Award comment reward once per user/post on approval, only for admin/superadmin posts
+        try:
+            post = fb.post
+            user = fb.author
+            role = getattr(post, "created_by_role", None)
+            if getattr(post, "admin_author_id", None) or role in ("admin", "superadmin"):
+                # Enforce idempotency: only first approved comment per user/post grants coins
+                from django.conf import settings
+                from django.db import transaction, IntegrityError
+                from django.db.models import F
+                tval = getattr(settings, "REWARD_COMMENT_TOKENS", 30)
+                # Fast path: skip if a comment reward already exists
+                exists = RewardTransaction.objects.filter(
+                    user=user,
+                    post=post,
+                    action_type=RewardTransaction.ACT_COMMENT,
+                ).exists()
+                if not exists:
+                    try:
+                        with transaction.atomic():
+                            obj, created = RewardTransaction.objects.get_or_create(
+                                user=user,
+                                post=post,
+                                action_type=RewardTransaction.ACT_COMMENT,
+                                defaults={"tokens": tval},
+                            )
+                            if created and tval > 0:
+                                bal, _ = UserTokenBalance.objects.select_for_update().get_or_create(user=user, defaults={"balance": 0})
+                                bal.balance = F("balance") + tval
+                                bal.save(update_fields=["balance", "updated_at"])
+                    except IntegrityError:
+                        # Another concurrent approval created the reward; do nothing
+                        pass
+        except Exception:
+            pass
         # Optional: notify post author via email
         author = getattr(getattr(fb.post, "author", None), "email", None)
         if author:
@@ -1148,3 +1324,156 @@ class EditRejectedFeedbackView(generics.GenericAPIView):
         fb.status = Feedback.STATUS_PENDING
         fb.save(update_fields=["content", "status"])
         return Response(FeedbackSerializer(fb).data)
+
+
+class ToggleLikeView(generics.GenericAPIView):
+    """Normal user toggles like on a post; reward like on admin-authored posts.
+    """
+    permission_classes = [IsNormalUser]
+
+    def post(self, request, *args, **kwargs):
+        post_id = request.data.get("post_id")
+        if not post_id:
+            return Response({"detail": "post_id is required"}, status=400)
+        post = get_object_or_404(Post, pk=post_id)
+        user = request.user.normal_user
+        react, created = PostReaction.objects.get_or_create(user=user, post=post, reaction_type=PostReaction.REACT_LIKE)
+        if not created:
+            react.delete()
+            # If there was a like reward for this user/post, revoke it
+            try:
+                role = getattr(post, "created_by_role", None)
+                if getattr(post, "admin_author_id", None) or role in ("admin", "superadmin"):
+                    from django.conf import settings
+                    from django.db import transaction
+                    from django.db.models import F
+                    tval = getattr(settings, "REWARD_LIKE_TOKENS", 20)
+                    with transaction.atomic():
+                        txn = RewardTransaction.objects.filter(user=user, post=post, action_type=RewardTransaction.ACT_LIKE).first()
+                        if txn:
+                            # Delete transaction and subtract tokens
+                            txn.delete()
+                            bal, _ = UserTokenBalance.objects.select_for_update().get_or_create(user=user, defaults={"balance": 0})
+                            # Prevent negative balance
+                            bal.balance = F("balance") - tval
+                            bal.save(update_fields=["balance", "updated_at"])
+            except Exception:
+                pass
+            return Response({"liked": False})
+        # Award like reward once (unique per action enforced by RewardTransaction)
+        try:
+            role = getattr(post, "created_by_role", None)
+            if getattr(post, "admin_author_id", None) or role in ("admin", "superadmin"):
+                self._award_reward(user=user, post=post, action=RewardTransaction.ACT_LIKE)
+        except Exception:
+            pass
+        return Response({"liked": True})
+
+    def _award_reward(self, user, post, action):
+        from django.conf import settings
+        from django.utils import timezone
+        from django.db import transaction
+        from django.db.models import F
+        tokens_table = {
+            RewardTransaction.ACT_VIEW: getattr(settings, "REWARD_VIEW_TOKENS", 1),
+            RewardTransaction.ACT_LIKE: getattr(settings, "REWARD_LIKE_TOKENS", 2),
+            RewardTransaction.ACT_COMMENT: getattr(settings, "REWARD_COMMENT_TOKENS", 5),
+        }
+        limits_table = {
+            RewardTransaction.ACT_VIEW: getattr(settings, "REWARD_VIEW_DAILY_LIMIT", 50),
+            RewardTransaction.ACT_LIKE: getattr(settings, "REWARD_LIKE_DAILY_LIMIT", 20),
+            RewardTransaction.ACT_COMMENT: getattr(settings, "REWARD_COMMENT_DAILY_LIMIT", 10),
+        }
+        tval = tokens_table.get(action, 0)
+        start_of_day = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        awarded_today = RewardTransaction.objects.filter(user=user, action_type=action, created_at__gte=start_of_day).count()
+        if awarded_today >= limits_table.get(action, 0):
+            return
+        with transaction.atomic():
+            obj, created = RewardTransaction.objects.get_or_create(
+                user=user,
+                post=post,
+                action_type=action,
+                defaults={"tokens": tval},
+            )
+            if created and tval > 0:
+                bal, _ = UserTokenBalance.objects.select_for_update().get_or_create(user=user, defaults={"balance": 0})
+                bal.balance = F("balance") + tval
+                bal.save(update_fields=["balance", "updated_at"])
+
+
+class RecordViewRewardView(generics.GenericAPIView):
+    """Record a view of a post and award tokens one-time if admin-authored."""
+    permission_classes = [IsNormalUser]
+
+    def post(self, request, *args, **kwargs):
+        post_id = request.data.get("post_id")
+        if not post_id:
+            return Response({"detail": "post_id is required"}, status=400)
+        post = get_object_or_404(Post, pk=post_id)
+        user = request.user.normal_user
+        awarded = False
+        tokens_awarded = 0
+        try:
+            role = getattr(post, "created_by_role", None)
+            if getattr(post, "admin_author_id", None) or role in ("admin", "superadmin"):
+                tokens_awarded = self._award_reward(user=user, post=post, action=RewardTransaction.ACT_VIEW)
+                awarded = tokens_awarded > 0
+        except Exception:
+            pass
+        return Response({"view_recorded": True, "awarded": awarded, "tokens": tokens_awarded})
+
+    def _award_reward(self, user, post, action):
+        from django.conf import settings
+        from django.utils import timezone
+        from django.db import transaction
+        from django.db.models import F
+        tokens_table = {
+            RewardTransaction.ACT_VIEW: getattr(settings, "REWARD_VIEW_TOKENS", 1),
+            RewardTransaction.ACT_LIKE: getattr(settings, "REWARD_LIKE_TOKENS", 2),
+            RewardTransaction.ACT_COMMENT: getattr(settings, "REWARD_COMMENT_TOKENS", 5),
+        }
+        limits_table = {
+            RewardTransaction.ACT_VIEW: getattr(settings, "REWARD_VIEW_DAILY_LIMIT", 50),
+            RewardTransaction.ACT_LIKE: getattr(settings, "REWARD_LIKE_DAILY_LIMIT", 20),
+            RewardTransaction.ACT_COMMENT: getattr(settings, "REWARD_COMMENT_DAILY_LIMIT", 10),
+        }
+        tval = tokens_table.get(action, 0)
+        start_of_day = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        awarded_today = RewardTransaction.objects.filter(user=user, action_type=action, created_at__gte=start_of_day).count()
+        if awarded_today >= limits_table.get(action, 0):
+            return 0
+        with transaction.atomic():
+            obj, created = RewardTransaction.objects.get_or_create(
+                user=user,
+                post=post,
+                action_type=action,
+                defaults={"tokens": tval},
+            )
+            if created and tval > 0:
+                bal, _ = UserTokenBalance.objects.select_for_update().get_or_create(user=user, defaults={"balance": 0})
+                bal.balance = F("balance") + tval
+                bal.save(update_fields=["balance", "updated_at"])
+                return tval
+        return 0
+
+class MeTokenBalanceView(generics.GenericAPIView):
+    """Return the current user's token balance."""
+    permission_classes = [IsNormalUser]
+
+    def get(self, request, *args, **kwargs):
+        user = request.user.normal_user
+        bal, _ = UserTokenBalance.objects.get_or_create(user=user)
+        return Response({"balance": bal.balance})
+
+
+class MeRewardHistoryView(generics.ListAPIView):
+    """List the current user's reward transactions with post info."""
+    permission_classes = [IsNormalUser]
+    serializer_class = RewardTransactionSerializer
+
+    def get_queryset(self):
+        user = getattr(self.request.user, "normal_user", None)
+        if not user:
+            return RewardTransaction.objects.none()
+        return RewardTransaction.objects.filter(user=user).order_by("-created_at", "-id")

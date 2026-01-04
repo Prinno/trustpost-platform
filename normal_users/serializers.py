@@ -2,12 +2,13 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, Feedback
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, Feedback, RewardTransaction, PostReaction
 from .models import PostVersion
 import json
 
 
 class NormalUserSerializer(serializers.ModelSerializer):
+    avatar_url = serializers.SerializerMethodField(read_only=True)
     class Meta:
         model = NormalUser
         fields = [
@@ -22,6 +23,14 @@ class NormalUserSerializer(serializers.ModelSerializer):
             "is_phone_verified",
             "created_at",
         ]
+
+    def get_avatar_url(self, obj):
+        # Always return a relative media path for avatar
+        try:
+            from .utils import normalize_media_url
+            return normalize_media_url(getattr(obj, "avatar_url", None))
+        except Exception:
+            return getattr(obj, "avatar_url", None)
 
 
 class NormalUserUpdateSerializer(serializers.ModelSerializer):
@@ -65,6 +74,14 @@ class NormalUserUpdateSerializer(serializers.ModelSerializer):
         if not value.startswith("@"):
             value = f"@{value}"
         return value
+
+    def validate_avatar_url(self, value):
+        # Accept any form but store relative media path only
+        try:
+            from .utils import normalize_media_url
+            return normalize_media_url(value)
+        except Exception:
+            return value
 
 
 class RegisterSerializer(serializers.Serializer):
@@ -193,6 +210,7 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
 
 
 class PostItemSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField(read_only=True)
     class Meta:
         model = PostItem
         fields = [
@@ -203,11 +221,21 @@ class PostItemSerializer(serializers.ModelSerializer):
             "order",
         ]
 
+    def get_file_url(self, obj):
+        # Ensure file_url is always a relative media path
+        try:
+            from .utils import normalize_media_url
+            return normalize_media_url(getattr(obj, "file_url", None))
+        except Exception:
+            return getattr(obj, "file_url", None)
+
 
 class PostSerializer(serializers.ModelSerializer):
     items = PostItemSerializer(many=True, required=False)
     author_public_username = serializers.SerializerMethodField(read_only=True)
     author_avatar_url = serializers.SerializerMethodField(read_only=True)
+    author_role = serializers.SerializerMethodField(read_only=True)
+    is_liked_by_user = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Post
@@ -216,6 +244,8 @@ class PostSerializer(serializers.ModelSerializer):
             "author",
             "author_public_username",
             "author_avatar_url",
+            "author_role",
+            "is_liked_by_user",
             "mode",
             "main_text",
             "status",
@@ -232,7 +262,33 @@ class PostSerializer(serializers.ModelSerializer):
         return pu if pu else None
 
     def get_author_avatar_url(self, obj):
-        return getattr(getattr(obj, "author", None), "avatar_url", None)
+        # For admin-authored posts, no avatar is defined here
+        try:
+            from .utils import normalize_media_url
+            return normalize_media_url(getattr(getattr(obj, "author", None), "avatar_url", None))
+        except Exception:
+            return getattr(getattr(obj, "author", None), "avatar_url", None)
+
+    def get_author_role(self, obj):
+        try:
+            if getattr(obj, "author", None):
+                return "normal"
+            acc = getattr(obj, "admin_author", None)
+            if acc:
+                return getattr(acc, "role", None) or getattr(obj, "created_by_role", None)
+        except Exception:
+            pass
+        return getattr(obj, "created_by_role", None)
+
+    def get_is_liked_by_user(self, obj):
+        try:
+            request = self.context.get("request")
+            user = getattr(getattr(request, "user", None), "normal_user", None)
+            if not user:
+                return False
+            return PostReaction.objects.filter(user=user, post=obj, reaction_type=PostReaction.REACT_LIKE).exists()
+        except Exception:
+            return False
 
     def to_representation(self, instance):
         """
@@ -251,10 +307,12 @@ class PostSerializer(serializers.ModelSerializer):
                     try:
                         snap = json.loads(pv.items_json or "[]")
                         for it in snap:
+                            # Normalize snapshot file_url to relative path
+                            from .utils import normalize_media_url
                             items.append({
                                 "id": None,
                                 "media_type": it.get("media_type"),
-                                "file_url": it.get("file_url"),
+                                "file_url": normalize_media_url(it.get("file_url")),
                                 "caption_text": it.get("caption_text") or "",
                                 "order": it.get("order") or 0,
                             })
@@ -263,6 +321,18 @@ class PostSerializer(serializers.ModelSerializer):
                     data["items"] = items
         except Exception:
             # Fail-safe: leave default representation
+            pass
+        # Always normalize file_url for items to ensure relative paths
+        try:
+            from .utils import normalize_media_url
+            normd = []
+            for it in (data.get("items") or []):
+                fu = normalize_media_url(it.get("file_url")) if isinstance(it, dict) else None
+                if isinstance(it, dict):
+                    it = {**it, "file_url": fu}
+                normd.append(it)
+            data["items"] = normd
+        except Exception:
             pass
         return data
 
@@ -291,16 +361,35 @@ class PostSerializer(serializers.ModelSerializer):
             if items:
                 raise serializers.ValidationError("Text-only posts must have no media items")
 
-        # B: Single media + text
+        # B: Single media + text (admins may post poster without text)
         if mode == Post.SINGLE_WITH_TEXT:
-            if not main_text:
+            # Determine if the requester is an admin/superadmin
+            is_admin = False
+            try:
+                req = self.context.get("request")
+                user = getattr(req, "user", None)
+                if user is not None:
+                    is_admin = bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
+            except Exception:
+                is_admin = False
+            # For normal users, main_text is required; admins can skip for posters
+            if not main_text and not is_admin:
                 raise serializers.ValidationError("Main text is required for single media mode")
             if not isinstance(items, list) or len(items) != 1:
                 raise serializers.ValidationError("Single media mode requires exactly one media item")
 
-        # D: Multiple media + shared text
+        # D: Multiple media + shared text (admins may post poster set without shared text)
         if mode == Post.MULTI_SHARED:
-            if not main_text:
+            # Determine if the requester is an admin/superadmin
+            is_admin = False
+            try:
+                req = self.context.get("request")
+                user = getattr(req, "user", None)
+                if user is not None:
+                    is_admin = bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
+            except Exception:
+                is_admin = False
+            if not main_text and not is_admin:
                 raise serializers.ValidationError("Shared text is required for multiple media shared mode")
             if not isinstance(items, list) or len(items) < 2:
                 raise serializers.ValidationError("Shared mode requires two or more media items")
@@ -311,32 +400,77 @@ class PostSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("Main text must be empty in per-media text mode")
             if not isinstance(items, list) or len(items) < 2:
                 raise serializers.ValidationError("Per-media mode requires two or more media items")
+            # Allow admins to omit per-item captions for poster-style posts
+            is_admin = False
+            try:
+                req = self.context.get("request")
+                user = getattr(req, "user", None)
+                if user is not None:
+                    is_admin = bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
+            except Exception:
+                is_admin = False
             for idx, it in enumerate(items or []):
                 caption = (it.get("caption_text") or "").strip()
-                if not caption:
+                if not caption and not is_admin:
                     raise serializers.ValidationError(f"Caption required for item #{idx + 1}")
                 if len(caption) > 3000:
                     raise serializers.ValidationError(f"Caption for item #{idx + 1} exceeds 3000 characters")
 
+        # Common media validations (for any mode with items)
+        if isinstance(items, list) and items:
+            for idx, it in enumerate(items):
+                mt = (it.get("media_type") or "").strip()
+                if mt not in {PostItem.IMAGE, PostItem.VIDEO}:
+                    raise serializers.ValidationError(f"Invalid media_type for item #{idx + 1}")
+                fu = (it.get("file_url") or "").strip()
+                if not fu:
+                    raise serializers.ValidationError(f"Missing file_url for item #{idx + 1}")
+
         return attrs
 
     def create(self, validated_data):
-        items_data = validated_data.pop("items", [])
+        # Always use raw incoming items to ensure fields like file_url are available
+        try:
+            items_data = list(self.initial_data.get("items", []))
+        except Exception:
+            items_data = []
+        # Remove any nested items from validated_data to avoid confusion
+        validated_data.pop("items", None)
         request = self.context.get("request")
+        # Normal user author
         author = getattr(getattr(request, "user", None), "normal_user", None)
-        if not author:
-            raise serializers.ValidationError("Invalid author")
-        # Enforce posting restrictions
-        active_post_bans = UserRestriction.objects.filter(user=author, type=UserRestriction.TYPE_POST_SUSPEND).all()
-        for r in active_post_bans:
-            if r.is_active():
-                raise serializers.ValidationError("Posting is temporarily disabled for your account")
-        post = Post.objects.create(author=author, status=Post.PENDING, **validated_data)
+        # Admin/SuperAdmin author
+        admin_acc = getattr(getattr(request, "user", None), "admin_account", None)
+        if author:
+            # Enforce posting restrictions for normal users
+            active_post_bans = UserRestriction.objects.filter(user=author, type=UserRestriction.TYPE_POST_SUSPEND).all()
+            for r in active_post_bans:
+                if r.is_active():
+                    raise serializers.ValidationError("Posting is temporarily disabled for your account")
+            post = Post.objects.create(author=author, status=Post.PENDING, created_by_role="normal", **validated_data)
+        elif admin_acc:
+            # Admin-created posts default to pending until explicitly published
+            role = getattr(admin_acc, "role", "admin")
+            post = Post.objects.create(admin_author=admin_acc, status=Post.PENDING, created_by_role=role, **validated_data)
+        else:
+            # Fallback: allow staff/superuser admins even without AdminAccount row
+            user = getattr(request, "user", None)
+            if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+                role = "superadmin" if getattr(user, "is_superuser", False) else "admin"
+                post = Post.objects.create(status=Post.PENDING, created_by_role=role, **validated_data)
+            else:
+                raise serializers.ValidationError("Invalid author")
+        from .utils import normalize_media_url
         for order, item in enumerate(items_data):
+            # Normalize and enforce presence of file_url
+            norm_url = normalize_media_url(item.get("file_url"))
+            if not norm_url:
+                raise serializers.ValidationError(f"Invalid media URL for item #{order + 1}")
             PostItem.objects.create(
                 post=post,
                 media_type=item.get("media_type"),
-                file_url=item.get("file_url"),
+                # Store only relative media path
+                file_url=norm_url,
                 caption_text=item.get("caption_text", "") or "",
                 order=item.get("order", order),
             )
@@ -420,3 +554,33 @@ class FeedbackSerializer(serializers.ModelSerializer):
         validated_data["author"] = author
         validated_data["status"] = Feedback.STATUS_PENDING
         return super().create(validated_data)
+
+
+class RewardTransactionSerializer(serializers.ModelSerializer):
+    post_id = serializers.SerializerMethodField(read_only=True)
+    post_main_text_snippet = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = RewardTransaction
+        fields = [
+            "id",
+            "post_id",
+            "action_type",
+            "tokens",
+            "post_main_text_snippet",
+            "created_at",
+        ]
+        read_only_fields = ["id", "post_id", "action_type", "tokens", "post_main_text_snippet", "created_at"]
+
+    def get_post_id(self, obj):
+        return getattr(getattr(obj, "post", None), "id", None)
+
+    def get_post_main_text_snippet(self, obj):
+        try:
+            txt = getattr(getattr(obj, "post", None), "main_text", "") or ""
+            txt = txt.strip()
+            if len(txt) <= 80:
+                return txt
+            return txt[:77] + "..."
+        except Exception:
+            return None

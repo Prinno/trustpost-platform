@@ -27,7 +27,7 @@ SECRET_KEY = "django-insecure-df0h8)-5cl0$^n37i#uor_823eai!mwf@dep(2zx%91hqdv!t2
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-#ALLOWED_HOSTS = [ 'localhost', '192.168.1.189',"127.0.0.1"]
+# ALLOWED_HOSTS = [ 'localhost', '192.168.1.189',"127.0.0.1"]
 ALLOWED_HOSTS = [ '*']
 
 
@@ -194,3 +194,13 @@ NORMAL_USER_VERIFY_TOKEN_HOURS = 24
 NORMAL_USER_EMAIL_VERIFY_URL = "https://trustpost-platform.onrender.com/api/auth/verify-email/"
 NORMAL_USER_PASSWORD_RESET_URL = "/api/auth/password-reset/confirm/"
 # lxtc pnvq lboz czed app password from gmail 
+
+# Reward system defaults (coins)
+# Per requirements: View=10, Like=20, Comment=30
+REWARD_VIEW_TOKENS = 10
+REWARD_LIKE_TOKENS = 20
+REWARD_COMMENT_TOKENS = 30
+# Daily reward limits per action (configurable)
+REWARD_VIEW_DAILY_LIMIT = int(os.environ.get("REWARD_VIEW_DAILY_LIMIT", 50))
+REWARD_LIKE_DAILY_LIMIT = int(os.environ.get("REWARD_LIKE_DAILY_LIMIT", 20))
+REWARD_COMMENT_DAILY_LIMIT = int(os.environ.get("REWARD_COMMENT_DAILY_LIMIT", 10))
