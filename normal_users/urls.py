@@ -2,6 +2,7 @@ from django.urls import path
 from .views import (
     RegisterView,
     LoginView,
+    NormalUserListView,
     RequestEmailVerificationView,
     VerifyEmailView,
     PasswordResetRequestView,
@@ -48,6 +49,7 @@ from .views import (
 urlpatterns = [
     path("register/", RegisterView.as_view(), name="nu-register"),
     path("login/", LoginView.as_view(), name="nu-login"),
+    path("users/", NormalUserListView.as_view(), name="nu-users-list"),
     path("refresh/", refresh_view, name="nu-refresh"),
     path("logout/", logout_view, name="nu-logout"),
 

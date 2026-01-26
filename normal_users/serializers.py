@@ -33,6 +33,26 @@ class NormalUserSerializer(serializers.ModelSerializer):
             return getattr(obj, "avatar_url", None)
 
 
+class PublicUserSerializer(serializers.ModelSerializer):
+    avatar_url = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = NormalUser
+        fields = [
+            "id",
+            "username",
+            "public_username",
+            "avatar_url",
+        ]
+
+    def get_avatar_url(self, obj):
+        try:
+            from .utils import normalize_media_url
+            return normalize_media_url(getattr(obj, "avatar_url", None))
+        except Exception:
+            return getattr(obj, "avatar_url", None)
+
+
 class NormalUserUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = NormalUser

@@ -20,6 +20,7 @@ from .permissions import IsNormalUser
 from .serializers import (
     LoginSerializer,
     NormalUserSerializer,
+    PublicUserSerializer,
     NormalUserUpdateSerializer,
     PasswordResetConfirmSerializer,
     PasswordResetRequestSerializer,
@@ -145,6 +146,33 @@ class LoginView(generics.GenericAPIView):
                 "email": user.email,
             },
         }, status=200)
+
+
+class NormalUserListView(generics.ListAPIView):
+    """List active, verified normal users (excluding current user), with optional search.
+
+    Query params:
+      - q: search term matching username or public_username (case-insensitive)
+      - limit: optional max results (default 100)
+    """
+    permission_classes = [IsNormalUser]
+    serializer_class = PublicUserSerializer
+
+    def get_queryset(self):
+        q = self.request.query_params.get("q", "").strip()
+        try:
+            limit = int(self.request.query_params.get("limit", 100))
+        except Exception:
+            limit = 100
+        qs = NormalUser.objects.filter(is_active=True, is_email_verified=True)
+        me = getattr(self.request.user, "normal_user", None)
+        if me:
+            qs = qs.exclude(pk=me.id)
+        if q:
+            qs = qs.filter(
+                models.Q(username__icontains=q) | models.Q(public_username__icontains=q)
+            )
+        return qs.order_by("username", "id")[: max(1, min(500, limit))]
 
 # class LoginView(generics.GenericAPIView):
 #     permission_classes = [AllowAny]

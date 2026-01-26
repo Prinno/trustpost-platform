@@ -7,3 +7,5 @@ whitenoise
 gunicorn
 dj-database-url
 djangorestframework-simplejwt
+channels>=4.0
+daphne>=4.0

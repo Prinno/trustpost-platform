@@ -1,3 +1,23 @@
+# Chat Backend Overview
+
+This project now includes a real-time DM chat feature using Django REST Framework + Django Channels.
+
+## Apps
+- `chat`: Conversations, messages, attachments, read receipts
+
+## Endpoints (under `/api/chat/`)
+- `POST conversations/create_or_get/` (`target_user_id`) → returns conversation
+- `GET conversations/` → list your conversations
+- `GET conversations/<id>/messages/?limit=30&before_id=<id>` → paginated messages
+- `POST conversations/<id>/send/` → send text/media message
+- `POST conversations/<id>/mark_read/` → mark messages as read
+
+## WebSocket
+- `ws://<host>/ws/chat/<conversation_id>/?token=<jwt>`
+  - events: `{event:"typing", typing:true}` and `{event:"read", message_ids:[...]}`
+
+## Setup
+Add `channels` and `daphne` to requirements and ensure ASGI is configured.
 # TruePost Backend (Django + DRF)
 
 Normal Users are stored in a separate table and authenticated via JWT. Django's built-in User/Admin/Superuser remain unchanged and login via Django Admin only.
