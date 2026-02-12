@@ -8,6 +8,17 @@ class NormalUser(models.Model):
     phone = models.CharField(max_length=20, unique=True, null=True, blank=True)
     public_username = models.CharField(max_length=50, unique=True, null=True, blank=True)
     avatar_url = models.URLField(null=True, blank=True)
+    # Human-friendly full name for search/display; optional but indexed
+    full_name = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+    # Longer profile bio text
+    bio = models.TextField(blank=True, default="")
+    # Privacy and discovery flags
+    is_private = models.BooleanField(default=False, db_index=True)
+    allow_discovery = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text="If false, user is excluded from discovery/search.",
+    )
     password = models.CharField(max_length=255)
     is_active = models.BooleanField(default=False)
     is_email_verified = models.BooleanField(default=False)
@@ -145,8 +156,20 @@ class Post(models.Model):
     status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=PENDING)
     rejection_reason = models.TextField(null=True, blank=True)
     last_approved_version = models.PositiveIntegerField(null=True, blank=True)
+    # Denormalized total view counter for fast reads in feeds
+    view_count = models.PositiveIntegerField(default=0, db_index=True)
+    # Denormalized total public comment counter for this post
+    comment_count = models.PositiveIntegerField(default=0, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            # Feed and profile queries sort by created_at; index it.
+            models.Index(fields=["created_at"]),
+            # Profile post listing: filter by author then order by created_at.
+            models.Index(fields=["author", "created_at"]),
+        ]
 
     def __str__(self):
         who = self.author_id or self.admin_author_id
@@ -260,6 +283,57 @@ class Feedback(models.Model):
         return f"Feedback#{self.pk} on Post#{self.post_id} by {self.author_id} ({self.status})"
 
 
+class PostView(models.Model):
+    """Tracks unique post views per normal user.
+
+    Used to ensure view_count is incremented at most once per user/post,
+    even if the client calls the view-recording endpoint multiple times.
+    """
+
+    user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="post_views")
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="post_views")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "post")
+        indexes = [
+            models.Index(fields=["user", "post"]),
+        ]
+
+    def __str__(self):
+        return f"PostView u#{self.user_id} p#{self.post_id}"
+
+
+class Comment(models.Model):
+    """Nested public comments on posts using an adjacency-list pattern.
+
+    Supports replies via self-referential parent, with a bounded depth
+    and denormalized reply_count for fast listing.
+    """
+
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="comments")
+    user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="comments")
+    parent = models.ForeignKey("self", null=True, blank=True, on_delete=models.CASCADE, related_name="replies")
+    depth = models.PositiveSmallIntegerField(default=0)
+    content = models.TextField()
+    is_deleted = models.BooleanField(default=False)
+    reply_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [
+            models.Index(fields=["post", "parent", "created_at"]),
+            models.Index(fields=["post", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["parent", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Comment#{self.pk} p#{self.post_id} d{self.depth} deleted={self.is_deleted}"
+
+
 class UserRestriction(models.Model):
     """Restrictions applied to NormalUser accounts (e.g., posting suspension)."""
     TYPE_POST_SUSPEND = "post_suspend"
@@ -347,3 +421,65 @@ class UserTokenBalance(models.Model):
 
     def __str__(self):
         return f"TokenBalance u#{self.user_id} = {self.balance}"
+
+
+class UserFollow(models.Model):
+    """Directed follow relationship between normal users.
+
+    Used for follower/following counts and discovery ranking. We intentionally
+    keep this model minimal and heavily indexed for scalability.
+    """
+
+    follower = models.ForeignKey(
+        NormalUser,
+        on_delete=models.CASCADE,
+        related_name="following_relations",
+    )
+    following = models.ForeignKey(
+        NormalUser,
+        on_delete=models.CASCADE,
+        related_name="follower_relations",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("follower", "following")
+        indexes = [
+            # Who follows this user, ordered by recency
+            models.Index(fields=["following", "created_at"]),
+            # Who this user follows, ordered by recency
+            models.Index(fields=["follower", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Follow u#{self.follower_id} -> u#{self.following_id}"
+
+
+class UserBlock(models.Model):
+    """Block relationship between users.
+
+    If either side has blocked the other, discovery/search/profile access
+    should be denied.
+    """
+
+    blocker = models.ForeignKey(
+        NormalUser,
+        on_delete=models.CASCADE,
+        related_name="blocks_initiated",
+    )
+    blocked = models.ForeignKey(
+        NormalUser,
+        on_delete=models.CASCADE,
+        related_name="blocks_received",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("blocker", "blocked")
+        indexes = [
+            models.Index(fields=["blocker", "blocked"]),
+            models.Index(fields=["blocked", "blocker"]),
+        ]
+
+    def __str__(self):
+        return f"Block u#{self.blocker_id} x u#{self.blocked_id}"

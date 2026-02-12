@@ -2,8 +2,7 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, Feedback, RewardTransaction, PostReaction
-from .models import PostVersion
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, Feedback, RewardTransaction, PostReaction, Comment, PostVersion
 import json
 
 
@@ -51,6 +50,87 @@ class PublicUserSerializer(serializers.ModelSerializer):
             return normalize_media_url(getattr(obj, "avatar_url", None))
         except Exception:
             return getattr(obj, "avatar_url", None)
+
+
+class UserSearchResultSerializer(serializers.ModelSerializer):
+    """Lightweight user representation for search/discovery lists.
+
+    Exposes only public profile fields and pre-annotated follower counts.
+    """
+
+    avatar_url = serializers.SerializerMethodField(read_only=True)
+    bio_short = serializers.SerializerMethodField(read_only=True)
+    followers_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = NormalUser
+        fields = [
+            "id",
+            "username",
+            "public_username",
+            "avatar_url",
+            "bio_short",
+            "followers_count",
+        ]
+
+    def get_avatar_url(self, obj):
+        try:
+            from .utils import normalize_media_url
+            return normalize_media_url(getattr(obj, "avatar_url", None))
+        except Exception:
+            return getattr(obj, "avatar_url", None)
+
+    def get_bio_short(self, obj):
+        bio = (getattr(obj, "bio", "") or "").strip()
+        if not bio:
+            return ""
+        return bio if len(bio) <= 120 else bio[:117] + "..."
+
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    """Public profile view for another user.
+
+    Follower/following/posts counts are expected to be annotated in the
+    queryset for performance, but we fall back to on-demand counts if
+    they are missing (e.g., in tests).
+    """
+
+    avatar_url = serializers.SerializerMethodField(read_only=True)
+    followers_count = serializers.IntegerField(read_only=True)
+    following_count = serializers.IntegerField(read_only=True)
+    posts_count = serializers.IntegerField(read_only=True)
+    joined_date = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = NormalUser
+        fields = [
+            "id",
+            "username",
+            "public_username",
+            "full_name",
+            "bio",
+            "avatar_url",
+            "followers_count",
+            "following_count",
+            "posts_count",
+            "joined_date",
+        ]
+
+    def get_avatar_url(self, obj):
+        try:
+            from .utils import normalize_media_url
+            return normalize_media_url(getattr(obj, "avatar_url", None))
+        except Exception:
+            return getattr(obj, "avatar_url", None)
+
+    def get_joined_date(self, obj):
+        dt = getattr(obj, "created_at", None)
+        if not dt:
+            return None
+        try:
+            return dt.date().isoformat()
+        except Exception:
+            return None
 
 
 class NormalUserUpdateSerializer(serializers.ModelSerializer):
@@ -256,6 +336,9 @@ class PostSerializer(serializers.ModelSerializer):
     author_avatar_url = serializers.SerializerMethodField(read_only=True)
     author_role = serializers.SerializerMethodField(read_only=True)
     is_liked_by_user = serializers.SerializerMethodField(read_only=True)
+    view_count = serializers.IntegerField(read_only=True)
+    like_count = serializers.IntegerField(read_only=True)
+    comment_count = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Post
@@ -266,6 +349,7 @@ class PostSerializer(serializers.ModelSerializer):
             "author_avatar_url",
             "author_role",
             "is_liked_by_user",
+            "view_count",
             "mode",
             "main_text",
             "status",
@@ -273,6 +357,8 @@ class PostSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "items",
+            "like_count",
+            "comment_count",
         ]
         read_only_fields = ["author", "status", "rejection_reason", "created_at", "updated_at"]
 
@@ -509,6 +595,31 @@ class ModerationActionSerializer(serializers.ModelSerializer):
             "reason",
             "created_at",
         ]
+
+
+class CommentSerializer(serializers.ModelSerializer):
+    """Serializer for nested comments with minimal embedded user info."""
+
+    user = PublicUserSerializer(read_only=True)
+    parent_id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Comment
+        fields = [
+            "id",
+            "content",
+            "user",
+            "parent_id",
+            "reply_count",
+            "depth",
+            "created_at",
+            "is_deleted",
+        ]
+
+
+class CommentCreateSerializer(serializers.Serializer):
+    content = serializers.CharField(max_length=3000)
+
 
 
 class UserRestrictionSerializer(serializers.ModelSerializer):

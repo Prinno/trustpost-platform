@@ -3,6 +3,10 @@ from .views import (
     RegisterView,
     LoginView,
     NormalUserListView,
+    UserDiscoverView,
+    UserSearchView,
+    UserPublicProfileView,
+    UserPublicPostsView,
     RequestEmailVerificationView,
     VerifyEmailView,
     PasswordResetRequestView,
@@ -44,12 +48,20 @@ from .views import (
     PublicApprovedFeedbackByPostView,
     MyRejectedFeedbackListView,
     EditRejectedFeedbackView,
+    PostCommentListCreateView,
+    CommentReplyListCreateView,
+    CommentDetailView,
+    # DemoWithdrawRequestView,
 )
 
 urlpatterns = [
     path("register/", RegisterView.as_view(), name="nu-register"),
     path("login/", LoginView.as_view(), name="nu-login"),
     path("users/", NormalUserListView.as_view(), name="nu-users-list"),
+    path("users/discover/", UserDiscoverView.as_view(), name="nu-users-discover"),
+    path("users/search/", UserSearchView.as_view(), name="nu-users-search"),
+    path("users/<int:pk>/", UserPublicProfileView.as_view(), name="nu-user-detail"),
+    path("users/<int:pk>/posts/", UserPublicPostsView.as_view(), name="nu-user-posts"),
     path("refresh/", refresh_view, name="nu-refresh"),
     path("logout/", logout_view, name="nu-logout"),
 
@@ -97,4 +109,8 @@ urlpatterns = [
     path("feedback/approved/by-post/<int:pk>/", PublicApprovedFeedbackByPostView.as_view(), name="feedback-approved-by-post"),
     path("feedback/rejected/mine/", MyRejectedFeedbackListView.as_view(), name="feedback-rejected-mine"),
     path("feedback/<int:pk>/edit/", EditRejectedFeedbackView.as_view(), name="feedback-edit"),
+    # Nested comment system
+    path("posts/<int:pk>/comments/", PostCommentListCreateView.as_view(), name="post-comments"),
+    path("comments/<int:pk>/replies/", CommentReplyListCreateView.as_view(), name="comment-replies"),
+    path("comments/<int:pk>/", CommentDetailView.as_view(), name="comment-detail"),
 ]

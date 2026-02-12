@@ -12,7 +12,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .authentication import create_jwt
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, PostVersion, Feedback, PostReaction, RewardTransaction, UserTokenBalance
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, PostVersion, Feedback, PostView, Comment, PostReaction, RewardTransaction, UserTokenBalance, UserFollow, UserBlock
 from admin_auth.permissions import IsAdminEnabled, IsSuperAdmin
 from admin_auth.models import AdminAccount
 from admin_auth.permissions import IsSuperAdmin
@@ -21,6 +21,8 @@ from .serializers import (
     LoginSerializer,
     NormalUserSerializer,
     PublicUserSerializer,
+    UserSearchResultSerializer,
+    UserProfileSerializer,
     NormalUserUpdateSerializer,
     PasswordResetConfirmSerializer,
     PasswordResetRequestSerializer,
@@ -34,12 +36,22 @@ from .serializers import (
     UserRestrictionSerializer,
     FeedbackSerializer,
     RewardTransactionSerializer,
+    CommentSerializer,
+    CommentCreateSerializer,
+)
+from .services.comment_service import (
+    create_comment,
+    edit_comment,
+    soft_delete_comment,
+    get_top_level_comments_queryset,
+    get_replies_queryset,
 )
 from .utils import generate_token, generate_otp, now_utc, email_send
 
 
 from django.contrib.auth.hashers import check_password
 from rest_framework_simplejwt.tokens import RefreshToken as SimpleJWTRefreshToken
+from django.db.models import Count, Exists, OuterRef, Case, When, Value, IntegerField
 
 
 ACCESS_MINUTES = getattr(settings, "NORMAL_USER_JWT_ACCESS_MINUTES", 15)
@@ -173,6 +185,198 @@ class NormalUserListView(generics.ListAPIView):
                 models.Q(username__icontains=q) | models.Q(public_username__icontains=q)
             )
         return qs.order_by("username", "id")[: max(1, min(500, limit))]
+
+
+class _PublicUserQueryMixin:
+    """Shared helpers for public user discovery/search/profile.
+
+    Ensures we always filter by active, verified, non-private, discoverable
+    users and apply mutual block rules.
+    """
+
+    def _base_public_qs(self, request):
+        me = getattr(getattr(request, "user", None), "normal_user", None)
+        qs = NormalUser.objects.filter(
+            is_active=True,
+            is_email_verified=True,
+            is_private=False,
+            allow_discovery=True,
+        )
+        if me:
+            qs = qs.exclude(pk=me.id)
+            # Exclude users where there is any block relation in either
+            # direction between the current user and the candidate.
+            outgoing = UserBlock.objects.filter(
+                blocker=me,
+                blocked=OuterRef("pk"),
+            )
+            incoming = UserBlock.objects.filter(
+                blocker=OuterRef("pk"),
+                blocked=me,
+            )
+            qs = qs.annotate(
+                _blocked_by_me=Exists(outgoing),
+                _blocked_me=Exists(incoming),
+            ).filter(_blocked_by_me=False, _blocked_me=False)
+        return qs
+
+
+class UserDiscoverView(_PublicUserQueryMixin, generics.GenericAPIView):
+    """Cursor-based random user discovery for the search tab.
+
+    - Excludes current user, private accounts, and blocked users.
+    - Uses an indexed approach instead of ORDER BY RANDOM() by choosing
+      a random starting id and walking forward, then wrapping around.
+    """
+
+    permission_classes = [IsNormalUser]
+    serializer_class = UserSearchResultSerializer
+    PAGE_SIZE_DEFAULT = 20
+    PAGE_SIZE_MAX = 50
+
+    def _encode_cursor(self, last_id: int) -> str:
+        import base64, json
+
+        payload = json.dumps({"last_id": last_id}).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii")
+
+    def _decode_cursor(self, cursor: str):
+        import base64, json
+
+        try:
+            data = base64.urlsafe_b64decode(cursor.encode("ascii"))
+            obj = json.loads(data.decode("utf-8"))
+            return int(obj.get("last_id"))
+        except Exception:
+            return None
+
+    def get(self, request, *args, **kwargs):
+        try:
+            page_size = int(request.query_params.get("page_size", self.PAGE_SIZE_DEFAULT))
+        except Exception:
+            page_size = self.PAGE_SIZE_DEFAULT
+        page_size = max(1, min(self.PAGE_SIZE_MAX, page_size))
+
+        cursor = request.query_params.get("cursor")
+        base_qs = self._base_public_qs(request).annotate(
+            followers_count=Count("follower_relations", distinct=True),
+        )
+
+        if not base_qs.exists():
+            return Response({"results": [], "next_cursor": None})
+
+        if cursor:
+            last_id = self._decode_cursor(cursor)
+            if last_id is None:
+                return Response({"detail": "Invalid cursor"}, status=400)
+            qs = base_qs.filter(id__gt=last_id).order_by("id")
+            users = list(qs[:page_size])
+        else:
+            # Choose a random starting id in the id range to avoid full table
+            # scans/sorts. This leverages the primary key index and is
+            # scalable to large user counts.
+            import random
+
+            max_id = base_qs.order_by("-id").values_list("id", flat=True).first()
+            if not max_id:
+                return Response({"results": [], "next_cursor": None})
+            start_id = random.randint(1, max_id)
+            primary = list(base_qs.filter(id__gte=start_id).order_by("id")[:page_size])
+            if len(primary) >= page_size:
+                users = primary
+            else:
+                remaining = page_size - len(primary)
+                wrap = list(base_qs.filter(id__lt=start_id).order_by("id")[:remaining])
+                users = primary + wrap
+
+        if not users:
+            return Response({"results": [], "next_cursor": None})
+
+        data = self.get_serializer(users, many=True).data
+        next_cursor = self._encode_cursor(users[-1].id) if len(users) == page_size else None
+        return Response({"results": data, "next_cursor": next_cursor})
+
+
+class UserSearchView(_PublicUserQueryMixin, generics.GenericAPIView):
+    """Username/full-name search with ranking and cursor pagination."""
+
+    permission_classes = [IsNormalUser]
+    serializer_class = UserSearchResultSerializer
+    PAGE_SIZE_DEFAULT = 20
+    PAGE_SIZE_MAX = 50
+
+    def _encode_cursor(self, last_id: int) -> str:
+        import base64, json
+
+        payload = json.dumps({"last_id": last_id}).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii")
+
+    def _decode_cursor(self, cursor: str):
+        import base64, json
+
+        try:
+            data = base64.urlsafe_b64decode(cursor.encode("ascii"))
+            obj = json.loads(data.decode("utf-8"))
+            return int(obj.get("last_id"))
+        except Exception:
+            return None
+
+    def get(self, request, *args, **kwargs):
+        q = (request.query_params.get("q", "") or "").strip()
+        # Basic abuse prevention: require minimal length.
+        if len(q) < 2:
+            return Response({"results": [], "next_cursor": None})
+
+        try:
+            page_size = int(request.query_params.get("page_size", self.PAGE_SIZE_DEFAULT))
+        except Exception:
+            page_size = self.PAGE_SIZE_DEFAULT
+        page_size = max(1, min(self.PAGE_SIZE_MAX, page_size))
+
+        cursor = request.query_params.get("cursor")
+        base_qs = self._base_public_qs(request)
+
+        qs = base_qs.filter(
+            models.Q(username__icontains=q)
+            | models.Q(public_username__icontains=q)
+            | models.Q(full_name__icontains=q)
+        ).annotate(
+            followers_count=Count("follower_relations", distinct=True),
+            exact_username=Case(
+                When(username__iexact=q, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+            exact_public_username=Case(
+                When(public_username__iexact=q, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+            exact_full_name=Case(
+                When(full_name__iexact=q, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            ),
+        ).order_by(
+            "-exact_username",
+            "-exact_public_username",
+            "-exact_full_name",
+            "id",
+        )
+
+        if cursor:
+            last_id = self._decode_cursor(cursor)
+            if last_id is None:
+                return Response({"detail": "Invalid cursor"}, status=400)
+            qs = qs.filter(id__gt=last_id)
+
+        users = list(qs[:page_size])
+        if not users:
+            return Response({"results": [], "next_cursor": None})
+
+        data = self.get_serializer(users, many=True).data
+        next_cursor = self._encode_cursor(users[-1].id) if len(users) == page_size else None
+        return Response({"results": data, "next_cursor": next_cursor})
 
 # class LoginView(generics.GenericAPIView):
 #     permission_classes = [AllowAny]
@@ -1129,12 +1333,144 @@ class PublicApprovedPostsView(generics.ListAPIView):
 
     def get_queryset(self):
         # Include posts in pending re-approval but still show their last approved snapshot
-        return Post.objects.filter(models.Q(status=Post.APPROVED) | models.Q(status=Post.PENDING_REAPPROVAL)).order_by("-created_at")
+        # Annotate each post with total likes to avoid N+1 queries.
+        return (
+            Post.objects
+            .filter(models.Q(status=Post.APPROVED) | models.Q(status=Post.PENDING_REAPPROVAL))
+            .annotate(
+                like_count=Count(
+                    "reactions",
+                    filter=models.Q(reactions__reaction_type=PostReaction.REACT_LIKE),
+                ),
+            )
+            .order_by("-created_at")
+        )
 
     def get_serializer_context(self):
         ctx = super().get_serializer_context()
         ctx["is_public"] = True
         return ctx
+
+
+class UserPublicProfileView(_PublicUserQueryMixin, generics.GenericAPIView):
+    """Read-only public profile for another normal user.
+
+    Applies privacy, discovery, and block rules, and returns aggregated
+    follower/following/post counts.
+    """
+
+    permission_classes = [IsNormalUser]
+    serializer_class = UserProfileSerializer
+
+    def get(self, request, pk, *args, **kwargs):
+        base_qs = self._base_public_qs(request)
+        qs = base_qs.filter(pk=pk).annotate(
+            followers_count=Count("follower_relations", distinct=True),
+            following_count=Count("following_relations", distinct=True),
+            posts_count=Count(
+                "posts",
+                filter=models.Q(posts__status=Post.APPROVED)
+                | models.Q(posts__status=getattr(Post, "PENDING_REAPPROVAL", Post.PENDING)),
+                distinct=True,
+            ),
+        )
+        user = qs.first()
+        if not user:
+            return Response({"detail": "Not found"}, status=404)
+        data = self.get_serializer(user).data
+        return Response(data)
+
+
+class UserPublicPostsView(_PublicUserQueryMixin, generics.GenericAPIView):
+    """Paginated list of public posts for a given user.
+
+    Uses cursor-based pagination on (created_at, id) for stability.
+    """
+
+    permission_classes = [IsNormalUser]
+    serializer_class = PostSerializer
+    PAGE_SIZE_DEFAULT = 20
+    PAGE_SIZE_MAX = 50
+
+    def _encode_cursor(self, created_at, last_id: int) -> str:
+        import base64, json
+
+        payload = json.dumps(
+            {"created_at": created_at.isoformat(), "last_id": last_id}
+        ).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii")
+
+    def _decode_cursor(self, cursor: str):
+        import base64, json
+        from datetime import datetime
+
+        try:
+            data = base64.urlsafe_b64decode(cursor.encode("ascii"))
+            obj = json.loads(data.decode("utf-8"))
+            created_at = datetime.fromisoformat(obj["created_at"])
+            last_id = int(obj["last_id"])
+            return created_at, last_id
+        except Exception:
+            return None, None
+
+    def get_queryset(self, owner: NormalUser):
+        return (
+            Post.objects.filter(
+                author=owner,
+                status__in=[Post.APPROVED, getattr(Post, "PENDING_REAPPROVAL", Post.APPROVED)],
+            )
+            .annotate(
+                like_count=Count(
+                    "reactions",
+                    filter=models.Q(reactions__reaction_type=PostReaction.REACT_LIKE),
+                ),
+            )
+            .select_related("author")
+            .prefetch_related("items")
+            .order_by("-created_at", "-id")
+        )
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["is_public"] = True
+        return ctx
+
+    def get(self, request, pk, *args, **kwargs):
+        try:
+            page_size = int(request.query_params.get("page_size", self.PAGE_SIZE_DEFAULT))
+        except Exception:
+            page_size = self.PAGE_SIZE_DEFAULT
+        page_size = max(1, min(self.PAGE_SIZE_MAX, page_size))
+
+        # Reuse the same visibility and block rules as discovery/search.
+        owner = self._base_public_qs(request).filter(pk=pk).first()
+        if not owner:
+            return Response({"results": [], "next_cursor": None}, status=404)
+
+        cursor = request.query_params.get("cursor")
+        qs = self.get_queryset(owner)
+
+        if cursor:
+            created_at, last_id = self._decode_cursor(cursor)
+            if created_at is None or last_id is None:
+                return Response({"detail": "Invalid cursor"}, status=400)
+            qs = qs.filter(
+                models.Q(created_at__lt=created_at)
+                | (models.Q(created_at=created_at) & models.Q(id__lt=last_id))
+            )
+
+        posts = list(qs[:page_size])
+        if not posts:
+            return Response({"results": [], "next_cursor": None})
+
+        data = self.get_serializer(posts, many=True).data
+        last = posts[-1]
+        next_cursor = (
+            self._encode_cursor(last.created_at, last.id)
+            if len(posts) == page_size
+            else None
+        )
+        return Response({"results": data, "next_cursor": next_cursor})
 
 
 class SubmitFeedbackView(generics.CreateAPIView):
@@ -1354,6 +1690,119 @@ class EditRejectedFeedbackView(generics.GenericAPIView):
         return Response(FeedbackSerializer(fb).data)
 
 
+class PostCommentListCreateView(generics.GenericAPIView):
+    """List and create top-level comments for a post.
+
+    GET  /posts/{id}/comments   -> paginated top-level comments
+    POST /posts/{id}/comments   -> create a top-level comment
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk, *args, **kwargs):
+        post = get_object_or_404(Post, pk=pk)
+        qs = get_top_level_comments_queryset(post)
+        page_size = int(request.query_params.get("page_size", 20))
+        page = int(request.query_params.get("page", 1))
+        if page < 1:
+            page = 1
+        offset = (page - 1) * page_size
+        items = list(qs[offset : offset + page_size])
+        data = CommentSerializer(items, many=True).data
+        return Response({
+            "results": data,
+            "page": page,
+            "page_size": page_size,
+        })
+
+    def post(self, request, pk, *args, **kwargs):
+        if not IsNormalUser().has_permission(request, self):
+            return Response({"detail": "Authentication required"}, status=401)
+        post = get_object_or_404(Post, pk=pk)
+        serializer = CommentCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        content = serializer.validated_data.get("content")
+        user = request.user.normal_user
+        try:
+            result = create_comment(user=user, post=post, content=content, parent=None)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        return Response(CommentSerializer(result.comment).data, status=201)
+
+
+class CommentReplyListCreateView(generics.GenericAPIView):
+    """List and create direct replies for a given comment.
+
+    GET  /comments/{id}/replies  -> paginated direct replies
+    POST /comments/{id}/replies  -> create a reply
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk, *args, **kwargs):
+        parent = get_object_or_404(Comment, pk=pk)
+        qs = get_replies_queryset(parent)
+        page_size = int(request.query_params.get("page_size", 20))
+        page = int(request.query_params.get("page", 1))
+        if page < 1:
+            page = 1
+        offset = (page - 1) * page_size
+        items = list(qs[offset : offset + page_size])
+        data = CommentSerializer(items, many=True).data
+        return Response({
+            "results": data,
+            "page": page,
+            "page_size": page_size,
+        })
+
+    def post(self, request, pk, *args, **kwargs):
+        if not IsNormalUser().has_permission(request, self):
+            return Response({"detail": "Authentication required"}, status=401)
+        parent = get_object_or_404(Comment, pk=pk)
+        serializer = CommentCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        content = serializer.validated_data.get("content")
+        user = request.user.normal_user
+        try:
+            result = create_comment(user=user, post=parent.post, content=content, parent=parent)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        return Response(CommentSerializer(result.comment).data, status=201)
+
+
+class CommentDetailView(generics.GenericAPIView):
+    """Edit or soft-delete a single comment.
+
+    PATCH /comments/{id}  -> edit
+    DELETE /comments/{id} -> soft delete
+    """
+
+    permission_classes = [IsNormalUser]
+
+    def patch(self, request, pk, *args, **kwargs):
+        comment = get_object_or_404(Comment, pk=pk)
+        user = request.user.normal_user
+        serializer = CommentCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        content = serializer.validated_data.get("content")
+        try:
+            updated = edit_comment(user=user, comment=comment, content=content)
+        except PermissionError as e:
+            return Response({"detail": str(e)}, status=403)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        return Response(CommentSerializer(updated).data)
+
+    def delete(self, request, pk, *args, **kwargs):
+        comment = get_object_or_404(Comment, pk=pk)
+        user = request.user.normal_user
+        try:
+            deleted = soft_delete_comment(user=user, comment=comment)
+        except PermissionError as e:
+            return Response({"detail": str(e)}, status=403)
+        return Response(CommentSerializer(deleted).data, status=200)
+
+
 class ToggleLikeView(generics.GenericAPIView):
     """Normal user toggles like on a post; reward like on admin-authored posts.
     """
@@ -1440,6 +1889,17 @@ class RecordViewRewardView(generics.GenericAPIView):
             return Response({"detail": "post_id is required"}, status=400)
         post = get_object_or_404(Post, pk=post_id)
         user = request.user.normal_user
+        # Increment the post's view counter only the first time this user views it.
+        # PostView ensures uniqueness per user/post; using F() keeps the update atomic.
+        from django.db import transaction
+        from django.db.models import F
+        view_recorded = False
+        with transaction.atomic():
+            pv, created = PostView.objects.get_or_create(user=user, post=post)
+            if created:
+                Post.objects.filter(pk=post.pk).update(view_count=F("view_count") + 1)
+                view_recorded = True
+        post.refresh_from_db(fields=["view_count"])
         awarded = False
         tokens_awarded = 0
         try:
@@ -1449,7 +1909,12 @@ class RecordViewRewardView(generics.GenericAPIView):
                 awarded = tokens_awarded > 0
         except Exception:
             pass
-        return Response({"view_recorded": True, "awarded": awarded, "tokens": tokens_awarded})
+        return Response({
+            "view_recorded": view_recorded,
+            "awarded": awarded,
+            "tokens": tokens_awarded,
+            "view_count": post.view_count,
+        })
 
     def _award_reward(self, user, post, action):
         from django.conf import settings
