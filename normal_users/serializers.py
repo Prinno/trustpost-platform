@@ -599,7 +599,54 @@ class PostSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(f"Missing file_url for item #{idx + 1}")
 
         return attrs
-
+    
+    def create(self, validated_data):
+        # Always use raw incoming items to ensure fields like file_url are available
+        try:
+            items_data = list(self.initial_data.get("items", []))
+        except Exception:
+            items_data = []
+        # Remove any nested items from validated_data to avoid confusion
+        validated_data.pop("items", None)
+        request = self.context.get("request")
+        # Normal user author
+        author = getattr(getattr(request, "user", None), "normal_user", None)
+        # Admin/SuperAdmin author
+        admin_acc = getattr(getattr(request, "user", None), "admin_account", None)
+        if author:
+            # Enforce posting restrictions for normal users
+            active_post_bans = UserRestriction.objects.filter(user=author, type=UserRestriction.TYPE_POST_SUSPEND).all()
+            for r in active_post_bans:
+                if r.is_active():
+                    raise serializers.ValidationError("Posting is temporarily disabled for your account")
+            post = Post.objects.create(author=author, status=Post.PENDING, created_by_role="normal", **validated_data)
+        elif admin_acc:
+            # Admin-created posts default to pending until explicitly published
+            role = getattr(admin_acc, "role", "admin")
+            post = Post.objects.create(admin_author=admin_acc, status=Post.PENDING, created_by_role=role, **validated_data)
+        else:
+            # Fallback: allow staff/superuser admins even without AdminAccount row
+            user = getattr(request, "user", None)
+            if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+                role = "superadmin" if getattr(user, "is_superuser", False) else "admin"
+                post = Post.objects.create(status=Post.PENDING, created_by_role=role, **validated_data)
+            else:
+                raise serializers.ValidationError("Invalid author")
+        from .utils import normalize_media_url
+        for order, item in enumerate(items_data):
+            # Normalize and enforce presence of file_url
+            norm_url = normalize_media_url(item.get("file_url"))
+            if not norm_url:
+                raise serializers.ValidationError(f"Invalid media URL for item #{order + 1}")
+            PostItem.objects.create(
+                post=post,
+                media_type=item.get("media_type"),
+                # Store only relative media path
+                file_url=norm_url,
+                caption_text=item.get("caption_text", "") or "",
+                order=item.get("order", order),
+            )
+        return post
 
 class AdReviewSerializer(serializers.ModelSerializer):
     """Serializer for advertiser reviews with public user name."""
@@ -648,53 +695,6 @@ class AdvertiserAnalyticsSummarySerializer(serializers.Serializer):
     average_rating = serializers.FloatField(allow_null=True)
     total_reviews = serializers.IntegerField()
 
-    def create(self, validated_data):
-        # Always use raw incoming items to ensure fields like file_url are available
-        try:
-            items_data = list(self.initial_data.get("items", []))
-        except Exception:
-            items_data = []
-        # Remove any nested items from validated_data to avoid confusion
-        validated_data.pop("items", None)
-        request = self.context.get("request")
-        # Normal user author
-        author = getattr(getattr(request, "user", None), "normal_user", None)
-        # Admin/SuperAdmin author
-        admin_acc = getattr(getattr(request, "user", None), "admin_account", None)
-        if author:
-            # Enforce posting restrictions for normal users
-            active_post_bans = UserRestriction.objects.filter(user=author, type=UserRestriction.TYPE_POST_SUSPEND).all()
-            for r in active_post_bans:
-                if r.is_active():
-                    raise serializers.ValidationError("Posting is temporarily disabled for your account")
-            post = Post.objects.create(author=author, status=Post.PENDING, created_by_role="normal", **validated_data)
-        elif admin_acc:
-            # Admin-created posts default to pending until explicitly published
-            role = getattr(admin_acc, "role", "admin")
-            post = Post.objects.create(admin_author=admin_acc, status=Post.PENDING, created_by_role=role, **validated_data)
-        else:
-            # Fallback: allow staff/superuser admins even without AdminAccount row
-            user = getattr(request, "user", None)
-            if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
-                role = "superadmin" if getattr(user, "is_superuser", False) else "admin"
-                post = Post.objects.create(status=Post.PENDING, created_by_role=role, **validated_data)
-            else:
-                raise serializers.ValidationError("Invalid author")
-        from .utils import normalize_media_url
-        for order, item in enumerate(items_data):
-            # Normalize and enforce presence of file_url
-            norm_url = normalize_media_url(item.get("file_url"))
-            if not norm_url:
-                raise serializers.ValidationError(f"Invalid media URL for item #{order + 1}")
-            PostItem.objects.create(
-                post=post,
-                media_type=item.get("media_type"),
-                # Store only relative media path
-                file_url=norm_url,
-                caption_text=item.get("caption_text", "") or "",
-                order=item.get("order", order),
-            )
-        return post
 
 
 class ModerationActionSerializer(serializers.ModelSerializer):
