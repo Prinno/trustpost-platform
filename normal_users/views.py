@@ -12,7 +12,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
 from .authentication import create_jwt
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, PostVersion, Feedback, PostView, Comment, PostReaction, RewardTransaction, UserTokenBalance, UserFollow, UserBlock
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, PostVersion, Feedback, PostView, Comment, PostReaction, RewardTransaction, UserTokenBalance, UserFollow, UserBlock, AdReview, PostShare
 from admin_auth.permissions import IsAdminEnabled, IsSuperAdmin
 from admin_auth.models import AdminAccount
 from admin_auth.permissions import IsSuperAdmin
@@ -38,6 +38,9 @@ from .serializers import (
     RewardTransactionSerializer,
     CommentSerializer,
     CommentCreateSerializer,
+    AdminAdvertiserSerializer,
+    AdReviewSerializer,
+    AdvertiserAnalyticsSummarySerializer,
 )
 from .services.comment_service import (
     create_comment,
@@ -51,7 +54,8 @@ from .utils import generate_token, generate_otp, now_utc, email_send
 
 from django.contrib.auth.hashers import check_password
 from rest_framework_simplejwt.tokens import RefreshToken as SimpleJWTRefreshToken
-from django.db.models import Count, Exists, OuterRef, Case, When, Value, IntegerField
+from django.db.models import Count, Exists, OuterRef, Case, When, Value, IntegerField, Sum, Avg, Q
+from django.db.models.functions import TruncDate
 
 
 ACCESS_MINUTES = getattr(settings, "NORMAL_USER_JWT_ACCESS_MINUTES", 15)
@@ -72,9 +76,12 @@ class RegisterView(generics.GenericAPIView):
         if pending.email:
             verify_url = f"{getattr(settings, 'NORMAL_USER_EMAIL_VERIFY_URL', '/api/auth/verify-email/')}?token={pending.token}"
             email_send("Verify your email", f"Click to verify: {verify_url}", pending.email)
-        return Response({
-            "detail": "Registration received. Verify your email to activate.",
-        }, status=status.HTTP_201_CREATED)
+        account_type = serializer.validated_data.get("account_type", NormalUser.ACCOUNT_TYPE_PERSON)
+        if account_type == NormalUser.ACCOUNT_TYPE_ADVERTISER:
+            detail = "Registration received. Verify your email. Your advertiser account will be reviewed and is pending approval."
+        else:
+            detail = "Registration received. Verify your email to activate your account."
+        return Response({"detail": detail}, status=status.HTTP_201_CREATED)
 
 
 
@@ -109,6 +116,14 @@ class LoginView(generics.GenericAPIView):
                 return Response({"detail": "Email not verified"}, status=403)
 
             if not normal_user.is_active:
+                # Provide clearer messaging for pending advertiser accounts
+                if (
+                    getattr(normal_user, "account_type", NormalUser.ACCOUNT_TYPE_PERSON)
+                    == NormalUser.ACCOUNT_TYPE_ADVERTISER
+                    and getattr(normal_user, "status", NormalUser.STATUS_ACTIVE)
+                    == NormalUser.STATUS_PENDING
+                ):
+                    return Response({"detail": "Your advertiser account is pending approval."}, status=403)
                 return Response({"detail": "Account inactive"}, status=403)
 
             # Issue app-native JWTs compatible with NormalUserJWTAuthentication
@@ -525,12 +540,32 @@ class VerifyEmailView(generics.GenericAPIView):
             if pr.phone and NormalUser.objects.filter(phone=pr.phone).exists():
                 return Response({"detail": "Phone already registered"}, status=409)
 
+            # Determine account type and status
+            account_type = pr.account_type or NormalUser.ACCOUNT_TYPE_PERSON
+            if account_type == NormalUser.ACCOUNT_TYPE_ADVERTISER:
+                status_value = NormalUser.STATUS_PENDING
+                is_active_value = False
+            else:
+                status_value = NormalUser.STATUS_ACTIVE
+                is_active_value = True
+
+            # For advertiser accounts, if organization_email/phone_number were
+            # not provided at registration time, fall back to the main
+            # email/phone so we don't require duplicate inputs on the client.
+            org_email = pr.organization_email or pr.email
+            org_phone_number = pr.phone_number or pr.phone
+
             user = NormalUser.objects.create(
                 username=pr.username,
                 email=pr.email,
                 phone=pr.phone,
                 password=pr.password,
-                is_active=True,
+                account_type=account_type,
+                status=status_value,
+                organization_name=pr.organization_name,
+                organization_email=org_email,
+                phone_number=org_phone_number,
+                is_active=is_active_value,
                 is_email_verified=True,
                 is_phone_verified=False,
             )
@@ -539,12 +574,26 @@ class VerifyEmailView(generics.GenericAPIView):
             pr.delete()
 
             if user.email:
-                email_send("Welcome to TruePost", "Email verified successfully. Please login.", user.email)
+                if account_type == NormalUser.ACCOUNT_TYPE_ADVERTISER:
+                    email_send(
+                        "Advertiser account pending approval",
+                        "Your email has been verified. Your advertiser account is pending approval by an administrator.",
+                        user.email,
+                    )
+                else:
+                    email_send(
+                        "Welcome to TruePost",
+                        "Email verified successfully. Please login.",
+                        user.email,
+                    )
 
-            return Response({
-                "detail": "Email verified successfully. Please login.",
-                "user": NormalUserSerializer(user).data,
-            })
+            detail_msg = (
+                "Email verified successfully. Please login."
+                if account_type == NormalUser.ACCOUNT_TYPE_PERSON
+                else "Email verified successfully. Your advertiser account is pending approval."
+            )
+
+            return Response({"detail": detail_msg, "user": NormalUserSerializer(user).data})
 
         # Legacy flow fallback
         vt = VerificationToken.objects.filter(token=token, type=VerificationToken.EMAIL_VERIFY).first()
@@ -1690,6 +1739,71 @@ class EditRejectedFeedbackView(generics.GenericAPIView):
         return Response(FeedbackSerializer(fb).data)
 
 
+class AdminPendingAdvertisersListView(generics.ListAPIView):
+    """List pending advertiser accounts for Admin/SuperAdmin review."""
+
+    permission_classes = [IsAdminEnabled]
+    serializer_class = AdminAdvertiserSerializer
+
+    def get_queryset(self):
+        return NormalUser.objects.filter(
+            account_type=NormalUser.ACCOUNT_TYPE_ADVERTISER,
+            status=NormalUser.STATUS_PENDING,
+        ).order_by("-created_at")
+
+
+class AdminApproveAdvertiserView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def post(self, request, pk, *args, **kwargs):
+        user = get_object_or_404(
+            NormalUser,
+            pk=pk,
+            account_type=NormalUser.ACCOUNT_TYPE_ADVERTISER,
+        )
+        if user.status != NormalUser.STATUS_PENDING:
+            return Response({"detail": "Advertiser is not pending"}, status=400)
+
+        user.status = NormalUser.STATUS_ACTIVE
+        user.is_active = True
+        user.save(update_fields=["status", "is_active"])
+
+        if user.email:
+            email_send(
+                "Advertiser account approved",
+                "Your advertiser account has been approved. You can now login and start using your account.",
+                user.email,
+            )
+
+        return Response(AdminAdvertiserSerializer(user).data)
+
+
+class AdminRejectAdvertiserView(generics.GenericAPIView):
+    permission_classes = [IsAdminEnabled]
+
+    def post(self, request, pk, *args, **kwargs):
+        user = get_object_or_404(
+            NormalUser,
+            pk=pk,
+            account_type=NormalUser.ACCOUNT_TYPE_ADVERTISER,
+        )
+        if user.status != NormalUser.STATUS_PENDING:
+            return Response({"detail": "Advertiser is not pending"}, status=400)
+
+        user.status = NormalUser.STATUS_REJECTED
+        user.is_active = False
+        user.save(update_fields=["status", "is_active"])
+
+        if user.email:
+            email_send(
+                "Advertiser account rejected",
+                "Your advertiser account request has been rejected.",
+                user.email,
+            )
+
+        return Response(AdminAdvertiserSerializer(user).data)
+
+
 class PostCommentListCreateView(generics.GenericAPIView):
     """List and create top-level comments for a post.
 
@@ -1970,3 +2084,149 @@ class MeRewardHistoryView(generics.ListAPIView):
         if not user:
             return RewardTransaction.objects.none()
         return RewardTransaction.objects.filter(user=user).order_by("-created_at", "-id")
+
+
+class RecordShareView(generics.GenericAPIView):
+    """Record a share event for a post (used for advertiser analytics)."""
+
+    permission_classes = [IsNormalUser]
+
+    def post(self, request, *args, **kwargs):
+        post_id = request.data.get("post_id")
+        if not post_id:
+            return Response({"detail": "post_id is required"}, status=400)
+        post = get_object_or_404(Post, pk=post_id)
+        user = request.user.normal_user
+        try:
+            PostShare.objects.create(user=user, post=post)
+        except Exception:
+            # Best-effort; avoid failing the client if duplicate or other issue
+            pass
+        total_shares = PostShare.objects.filter(post=post).count()
+        return Response({"shared": True, "shares_for_post": total_shares})
+
+
+class AdvertiserAnalyticsSummaryView(generics.GenericAPIView):
+    """Aggregated analytics for the current advertiser's posts (ads)."""
+
+    permission_classes = [IsNormalUser]
+    serializer_class = AdvertiserAnalyticsSummarySerializer
+
+    def get(self, request, *args, **kwargs):
+        user = getattr(request.user, "normal_user", None)
+        if not user:
+            return Response({"detail": "Not authenticated"}, status=401)
+        if getattr(user, "account_type", None) != NormalUser.ACCOUNT_TYPE_ADVERTISER:
+            return Response({"detail": "Advertiser account required"}, status=403)
+
+        posts_qs = Post.objects.filter(
+            author=user,
+            status__in=[Post.APPROVED, getattr(Post, "PENDING_REAPPROVAL", Post.APPROVED)],
+        )
+
+        agg = posts_qs.aggregate(
+            total_views=Sum("view_count"),
+            total_likes=Count(
+                "reactions",
+                filter=Q(reactions__reaction_type=PostReaction.REACT_LIKE),
+                distinct=True,
+            ),
+            total_dislikes=Count(
+                "reactions",
+                filter=Q(reactions__reaction_type=PostReaction.REACT_DISLIKE),
+                distinct=True,
+            ),
+            total_shares=Count("shares"),
+            total_comments=Sum("comment_count"),
+            total_reviews=Count("ad_reviews", distinct=True),
+            average_rating=Avg("ad_reviews__rating"),
+        )
+
+        # Gift / reward analytics: sum tokens on reward transactions for this
+        # advertiser's posts, broken down by action type.
+        reward_qs = RewardTransaction.objects.filter(post__in=posts_qs)
+        gift_totals = reward_qs.aggregate(
+            total_gift_tokens=Sum("tokens"),
+            gift_view_tokens=Sum(
+                "tokens",
+                filter=Q(action_type=RewardTransaction.ACT_VIEW),
+            ),
+            gift_like_tokens=Sum(
+                "tokens",
+                filter=Q(action_type=RewardTransaction.ACT_LIKE),
+            ),
+            gift_comment_tokens=Sum(
+                "tokens",
+                filter=Q(action_type=RewardTransaction.ACT_COMMENT),
+            ),
+        )
+
+        data = {
+            "total_views": int(agg.get("total_views") or 0),
+            "total_likes": int(agg.get("total_likes") or 0),
+            "total_dislikes": int(agg.get("total_dislikes") or 0),
+            "total_shares": int(agg.get("total_shares") or 0),
+            "total_comments": int(agg.get("total_comments") or 0),
+            "total_gift_tokens": int(gift_totals.get("total_gift_tokens") or 0),
+            "gift_view_tokens": int(gift_totals.get("gift_view_tokens") or 0),
+            "gift_like_tokens": int(gift_totals.get("gift_like_tokens") or 0),
+            "gift_comment_tokens": int(gift_totals.get("gift_comment_tokens") or 0),
+            "total_reviews": int(agg.get("total_reviews") or 0),
+            "average_rating": agg.get("average_rating"),
+        }
+
+        serializer = self.get_serializer(data)
+        return Response(serializer.data)
+
+
+class AdvertiserReviewsListView(generics.ListAPIView):
+    """List reviews for the current advertiser's posts (ads only)."""
+
+    permission_classes = [IsNormalUser]
+    serializer_class = AdReviewSerializer
+
+    def get_queryset(self):
+        user = getattr(self.request.user, "normal_user", None)
+        if not user or getattr(user, "account_type", None) != NormalUser.ACCOUNT_TYPE_ADVERTISER:
+            return AdReview.objects.none()
+        return (
+            AdReview.objects
+            .filter(post__author=user)
+            .select_related("user", "post")
+            .order_by("-created_at", "-id")
+        )
+
+
+class AdvertiserViewsOverTimeView(generics.GenericAPIView):
+    """Daily view counts over time for the current advertiser's posts."""
+
+    permission_classes = [IsNormalUser]
+
+    def get(self, request, *args, **kwargs):
+        user = getattr(request.user, "normal_user", None)
+        if not user:
+            return Response({"detail": "Not authenticated"}, status=401)
+        if getattr(user, "account_type", None) != NormalUser.ACCOUNT_TYPE_ADVERTISER:
+            return Response({"detail": "Advertiser account required"}, status=403)
+
+        try:
+            days = int(request.query_params.get("days", 30))
+        except Exception:
+            days = 30
+        days = max(1, min(days, 365))
+
+        since = timezone.now() - timedelta(days=days)
+        qs = (
+            PostView.objects
+            .filter(post__author=user, created_at__gte=since)
+            .annotate(d=TruncDate("created_at"))
+            .values("d")
+            .annotate(views=Count("id"))
+            .order_by("d")
+        )
+
+        results = [
+            {"date": row["d"].isoformat(), "views": row["views"]}
+            for row in qs
+        ]
+        return Response(results)

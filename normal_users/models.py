@@ -1,8 +1,25 @@
 from django.db import models
 from django.utils import timezone
+from django.core.validators import MinValueValidator, MaxValueValidator
 
 
 class NormalUser(models.Model):
+    ACCOUNT_TYPE_PERSON = "person"
+    ACCOUNT_TYPE_ADVERTISER = "advertiser"
+    ACCOUNT_TYPE_CHOICES = (
+        (ACCOUNT_TYPE_PERSON, "Person"),
+        (ACCOUNT_TYPE_ADVERTISER, "Advertiser"),
+    )
+
+    STATUS_ACTIVE = "active"
+    STATUS_PENDING = "pending"
+    STATUS_REJECTED = "rejected"
+    STATUS_CHOICES = (
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_PENDING, "Pending"),
+        (STATUS_REJECTED, "Rejected"),
+    )
+
     username = models.CharField(max_length=50, unique=True, null=True, blank=True)
     email = models.EmailField(unique=True, null=True, blank=True)
     phone = models.CharField(max_length=20, unique=True, null=True, blank=True)
@@ -20,6 +37,12 @@ class NormalUser(models.Model):
         help_text="If false, user is excluded from discovery/search.",
     )
     password = models.CharField(max_length=255)
+    account_type = models.CharField(max_length=16, choices=ACCOUNT_TYPE_CHOICES, default=ACCOUNT_TYPE_PERSON)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    # Optional advertiser-only organization fields
+    organization_name = models.CharField(max_length=255, null=True, blank=True)
+    organization_email = models.EmailField(null=True, blank=True)
+    phone_number = models.CharField(max_length=20, null=True, blank=True)
     is_active = models.BooleanField(default=False)
     is_email_verified = models.BooleanField(default=False)
     is_phone_verified = models.BooleanField(default=False)
@@ -59,6 +82,14 @@ class PendingRegistration(models.Model):
     email = models.EmailField(null=True, blank=True)
     phone = models.CharField(max_length=20, null=True, blank=True)
     password = models.CharField(max_length=255)  # already hashed
+    account_type = models.CharField(
+        max_length=16,
+        choices=NormalUser.ACCOUNT_TYPE_CHOICES,
+        default=NormalUser.ACCOUNT_TYPE_PERSON,
+    )
+    organization_name = models.CharField(max_length=255, null=True, blank=True)
+    organization_email = models.EmailField(null=True, blank=True)
+    phone_number = models.CharField(max_length=20, null=True, blank=True)
     token = models.CharField(max_length=128, unique=True)
     expires_at = models.DateTimeField()
     used = models.BooleanField(default=False)
@@ -283,6 +314,31 @@ class Feedback(models.Model):
         return f"Feedback#{self.pk} on Post#{self.post_id} by {self.author_id} ({self.status})"
 
 
+class AdReview(models.Model):
+    """Star rating + optional review comment for an advertisement/post.
+
+    Linked to a Post (typically advertiser-authored) and the NormalUser
+    who left the review.
+    """
+
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="ad_reviews")
+    user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="ad_reviews")
+    rating = models.PositiveSmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
+    comment = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        unique_together = ("post", "user")
+        indexes = [
+            models.Index(fields=["post", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"AdReview#{self.pk} p#{self.post_id} u#{self.user_id} r{self.rating}"
+
+
 class PostView(models.Model):
     """Tracks unique post views per normal user.
 
@@ -302,6 +358,23 @@ class PostView(models.Model):
 
     def __str__(self):
         return f"PostView u#{self.user_id} p#{self.post_id}"
+
+
+class PostShare(models.Model):
+    """Tracks share events for posts for analytics purposes."""
+
+    user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="post_shares")
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name="shares")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["post", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"PostShare u#{self.user_id} p#{self.post_id}"
 
 
 class Comment(models.Model):
@@ -361,12 +434,17 @@ class UserRestriction(models.Model):
 
 
 class PostReaction(models.Model):
-    """Reactions on posts by normal users. Currently supports like.
-    Unique per user/post/reaction_type to prevent duplicates.
+    """Reactions on posts by normal users.
+
+    Unique per user/post/reaction_type to prevent duplicates. Supports
+    both likes and dislikes for richer advertiser analytics.
     """
+
     REACT_LIKE = "like"
+    REACT_DISLIKE = "dislike"
     REACTION_CHOICES = (
         (REACT_LIKE, "Like"),
+        (REACT_DISLIKE, "Dislike"),
     )
 
     user = models.ForeignKey(NormalUser, on_delete=models.CASCADE, related_name="reactions")

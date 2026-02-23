@@ -2,21 +2,25 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, Feedback, RewardTransaction, PostReaction, Comment, PostVersion
+from .models import NormalUser, VerificationToken, PhoneOTP, RefreshToken, PendingRegistration, PasswordResetOTP, PasswordResetSession, Post, PostItem, ModerationAction, UserRestriction, Feedback, RewardTransaction, PostReaction, Comment, PostVersion, AdReview
 import json
 
 
 class NormalUserSerializer(serializers.ModelSerializer):
     avatar_url = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = NormalUser
         fields = [
             "id",
             "username",
             "public_username",
+            "organization_name",
             "email",
             "phone",
             "avatar_url",
+            "account_type",
+            "status",
             "is_active",
             "is_email_verified",
             "is_phone_verified",
@@ -30,6 +34,23 @@ class NormalUserSerializer(serializers.ModelSerializer):
             return normalize_media_url(getattr(obj, "avatar_url", None))
         except Exception:
             return getattr(obj, "avatar_url", None)
+
+
+class AdminAdvertiserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NormalUser
+        fields = [
+            "id",
+            "username",
+            "email",
+            "phone",
+            "account_type",
+            "status",
+            "organization_name",
+            "organization_email",
+            "phone_number",
+            "created_at",
+        ]
 
 
 class PublicUserSerializer(serializers.ModelSerializer):
@@ -190,6 +211,13 @@ class RegisterSerializer(serializers.Serializer):
     phone = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     password = serializers.CharField(write_only=True, min_length=8)
     confirm_password = serializers.CharField(write_only=True, min_length=8)
+    account_type = serializers.ChoiceField(
+        choices=[NormalUser.ACCOUNT_TYPE_PERSON, NormalUser.ACCOUNT_TYPE_ADVERTISER],
+        default=NormalUser.ACCOUNT_TYPE_PERSON,
+    )
+    organization_name = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=255)
+    organization_email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
+    phone_number = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=20)
 
     def validate(self, attrs):
         username = attrs.get("username", "").strip()
@@ -197,6 +225,10 @@ class RegisterSerializer(serializers.Serializer):
         phone = attrs.get("phone")
         password = attrs.get("password")
         confirm = attrs.get("confirm_password")
+        account_type = attrs.get("account_type") or NormalUser.ACCOUNT_TYPE_PERSON
+        org_name = attrs.get("organization_name")
+        org_email = attrs.get("organization_email")
+        org_phone_number = attrs.get("phone_number")
 
         if not username:
             raise serializers.ValidationError("Username is required.")
@@ -210,6 +242,14 @@ class RegisterSerializer(serializers.Serializer):
             raise serializers.ValidationError("Email already exists.")
         if phone and NormalUser.objects.filter(phone=phone).exists():
             raise serializers.ValidationError("Phone already registered.")
+
+        # Additional validation for advertiser accounts
+        if account_type == NormalUser.ACCOUNT_TYPE_ADVERTISER:
+            if not org_name or not org_name.strip():
+                raise serializers.ValidationError("Organization/Business name is required for advertiser accounts.")
+            # Do not require a second email/phone field; reuse main ones if needed.
+            if not (phone or org_phone_number):
+                raise serializers.ValidationError("A phone number is required for advertiser accounts.")
 
         return attrs
 
@@ -333,6 +373,7 @@ class PostItemSerializer(serializers.ModelSerializer):
 class PostSerializer(serializers.ModelSerializer):
     items = PostItemSerializer(many=True, required=False)
     author_public_username = serializers.SerializerMethodField(read_only=True)
+    author_full_name = serializers.SerializerMethodField(read_only=True)
     author_avatar_url = serializers.SerializerMethodField(read_only=True)
     author_role = serializers.SerializerMethodField(read_only=True)
     is_liked_by_user = serializers.SerializerMethodField(read_only=True)
@@ -346,6 +387,7 @@ class PostSerializer(serializers.ModelSerializer):
             "id",
             "author",
             "author_public_username",
+            "author_full_name",
             "author_avatar_url",
             "author_role",
             "is_liked_by_user",
@@ -366,6 +408,30 @@ class PostSerializer(serializers.ModelSerializer):
         pu = getattr(getattr(obj, "author", None), "public_username", None)
         # Only expose public handle if present
         return pu if pu else None
+
+    def get_author_full_name(self, obj):
+        """Return the public display name for the author.
+
+        For advertiser accounts, prefer organization_name as the public name.
+        Otherwise, fall back to full_name or username.
+        """
+        author = getattr(obj, "author", None)
+        if not author:
+            return None
+        # Advertiser: organization/business name takes priority
+        try:
+            if getattr(author, "account_type", None) == NormalUser.ACCOUNT_TYPE_ADVERTISER:
+                org = getattr(author, "organization_name", None)
+                if org:
+                    return org
+        except Exception:
+            pass
+
+        full_name = getattr(author, "full_name", None)
+        if full_name:
+            return full_name
+        username = getattr(author, "username", None)
+        return username if username else None
 
     def get_author_avatar_url(self, obj):
         # For admin-authored posts, no avatar is defined here
@@ -533,6 +599,54 @@ class PostSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(f"Missing file_url for item #{idx + 1}")
 
         return attrs
+
+
+class AdReviewSerializer(serializers.ModelSerializer):
+    """Serializer for advertiser reviews with public user name."""
+
+    user_public_name = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = AdReview
+        fields = [
+            "id",
+            "rating",
+            "comment",
+            "created_at",
+            "user_public_name",
+        ]
+
+    def get_user_public_name(self, obj):
+        user = getattr(obj, "user", None)
+        if not user:
+            return None
+        # For advertisers, prefer organization_name; else full_name or username
+        try:
+            if getattr(user, "account_type", None) == NormalUser.ACCOUNT_TYPE_ADVERTISER:
+                org = getattr(user, "organization_name", None)
+                if org:
+                    return org
+        except Exception:
+            pass
+        full_name = getattr(user, "full_name", None)
+        if full_name:
+            return full_name
+        username = getattr(user, "username", None)
+        return username if username else None
+
+
+class AdvertiserAnalyticsSummarySerializer(serializers.Serializer):
+    total_views = serializers.IntegerField()
+    total_likes = serializers.IntegerField()
+    total_dislikes = serializers.IntegerField()
+    total_shares = serializers.IntegerField()
+    total_comments = serializers.IntegerField()
+    total_gift_tokens = serializers.IntegerField()
+    gift_view_tokens = serializers.IntegerField()
+    gift_like_tokens = serializers.IntegerField()
+    gift_comment_tokens = serializers.IntegerField()
+    average_rating = serializers.FloatField(allow_null=True)
+    total_reviews = serializers.IntegerField()
 
     def create(self, validated_data):
         # Always use raw incoming items to ensure fields like file_url are available

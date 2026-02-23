@@ -38,6 +38,7 @@ from .views import (
     SubmitFeedbackView,
     ToggleLikeView,
     RecordViewRewardView,
+    RecordShareView,
     MeTokenBalanceView,
     MeRewardHistoryView,
     AdminPendingFeedbackListView,
@@ -48,6 +49,12 @@ from .views import (
     PublicApprovedFeedbackByPostView,
     MyRejectedFeedbackListView,
     EditRejectedFeedbackView,
+    AdvertiserAnalyticsSummaryView,
+    AdvertiserReviewsListView,
+    AdvertiserViewsOverTimeView,
+    AdminPendingAdvertisersListView,
+    AdminApproveAdvertiserView,
+    AdminRejectAdvertiserView,
     PostCommentListCreateView,
     CommentReplyListCreateView,
     CommentDetailView,
@@ -95,10 +102,15 @@ urlpatterns = [
     path("admin/posts/<int:pk>/", AdminDeletePostView.as_view(), name="admin-post-delete"),
     path("admin/warn/", AdminIssueWarningView.as_view(), name="admin-warn"),
     path("admin/restrict/", AdminApplyRestrictionView.as_view(), name="admin-restrict"),
+    # Admin advertiser management
+    path("admin/advertisers/pending/", AdminPendingAdvertisersListView.as_view(), name="admin-advertisers-pending"),
+    path("admin/advertisers/<int:pk>/approve/", AdminApproveAdvertiserView.as_view(), name="admin-advertiser-approve"),
+    path("admin/advertisers/<int:pk>/reject/", AdminRejectAdvertiserView.as_view(), name="admin-advertiser-reject"),
     path("posts/public/", PublicApprovedPostsView.as_view(), name="posts-public"),
     # Interactions and rewards
     path("posts/like/toggle/", ToggleLikeView.as_view(), name="posts-like-toggle"),
     path("posts/view/reward/", RecordViewRewardView.as_view(), name="posts-view-reward"),
+    path("posts/share/", RecordShareView.as_view(), name="posts-share"),
     # Feedback endpoints
     path("feedback/submit/", SubmitFeedbackView.as_view(), name="feedback-submit"),
     path("admin/feedback/pending/", AdminPendingFeedbackListView.as_view(), name="admin-feedback-pending"),
@@ -109,6 +121,10 @@ urlpatterns = [
     path("feedback/approved/by-post/<int:pk>/", PublicApprovedFeedbackByPostView.as_view(), name="feedback-approved-by-post"),
     path("feedback/rejected/mine/", MyRejectedFeedbackListView.as_view(), name="feedback-rejected-mine"),
     path("feedback/<int:pk>/edit/", EditRejectedFeedbackView.as_view(), name="feedback-edit"),
+    # Advertiser analytics
+    path("advertiser/analytics/summary/", AdvertiserAnalyticsSummaryView.as_view(), name="advertiser-analytics-summary"),
+    path("advertiser/analytics/reviews/", AdvertiserReviewsListView.as_view(), name="advertiser-analytics-reviews"),
+    path("advertiser/analytics/views-over-time/", AdvertiserViewsOverTimeView.as_view(), name="advertiser-views-over-time"),
     # Nested comment system
     path("posts/<int:pk>/comments/", PostCommentListCreateView.as_view(), name="post-comments"),
     path("comments/<int:pk>/replies/", CommentReplyListCreateView.as_view(), name="comment-replies"),
